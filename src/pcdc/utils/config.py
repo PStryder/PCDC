@@ -76,3 +76,42 @@ class ContinualConfig:
     # Task sequence
     n_tasks: int = 5
     classes_per_task: int = 2
+
+
+@dataclass
+class DepthTimeConfig:
+    """Configuration for depth-vs-time experiment grid.
+
+    Sweeps (hidden_sizes, K) to test whether settling steps
+    can substitute for structural depth.
+    """
+
+    # Grid axes
+    depth_configs: list[list[int]] = field(default_factory=lambda: [
+        [],            # no hidden layers (direct input -> output)
+        [128],         # 1 hidden, narrow
+        [256],         # 1 hidden, wider
+        [256, 128],    # 2 hidden
+        [1024, 256],   # 2 hidden, current default
+    ])
+    k_values: list[int] = field(default_factory=lambda: [5, 10, 20, 40, 80])
+
+    # PCHead hyperparameters (held constant across grid)
+    eta_x: float = 0.05
+    eta_w: float = 0.001
+    activation: str = "tanh"
+
+    # Continual learning settings
+    n_tasks: int = 5
+    classes_per_task: int = 2
+    replay_size: int = 1000
+    replay_mix: float = 0.25
+    replay_mode: str = "joint"
+
+    # Training
+    epochs_per_task: int = 10
+    batch_size: int = 64
+    seeds: list[int] = field(default_factory=lambda: [42, 123, 7])
+
+    # Output
+    output_dir: str = "./experiments/depth_vs_time"

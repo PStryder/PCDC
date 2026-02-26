@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 
 import torch
 import torch.nn as nn
@@ -315,6 +316,7 @@ class PCNetwork(nn.Module):
         current_eta_x = self.config.eta_x
         consecutive_increases = 0
 
+        t0 = time.perf_counter()
         with torch.no_grad():
             for step in range(K):
                 errors, preacts = self.compute_errors(x)
@@ -379,6 +381,7 @@ class PCNetwork(nn.Module):
                                 file=sys.stderr,
                             )
                         if stability == "strict":
+                            metrics.wall_clock_s = time.perf_counter() - t0
                             return metrics
                         # In adaptive mode, halve eta and continue
                         current_eta_x *= 0.5
@@ -389,6 +392,7 @@ class PCNetwork(nn.Module):
                         if patience_counter >= patience:
                             metrics.converged = True
                             metrics.steps_used = step + 1
+                            metrics.wall_clock_s = time.perf_counter() - t0
                             return metrics
                     else:
                         patience_counter = 0
@@ -406,6 +410,7 @@ class PCNetwork(nn.Module):
                 self._apply_state_norm(x, clamp_mask)
 
         metrics.steps_used = K
+        metrics.wall_clock_s = time.perf_counter() - t0
         return metrics
 
     def local_weight_update(

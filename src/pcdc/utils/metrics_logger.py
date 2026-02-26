@@ -28,6 +28,7 @@ class SettleMetrics:
     effective_eta_x: list[list[float]] = field(default_factory=list)  # per-step, per-layer
     converged: bool = False
     steps_used: int = 0
+    wall_clock_s: float = 0.0
 
     # Stability tracking
     oscillation_events: list[OscillationEvent] = field(default_factory=list)

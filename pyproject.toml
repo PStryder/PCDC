@@ -28,6 +28,7 @@ packages = ["src/pcdc"]
 [project.scripts]
 pcdc-mnist = "pcdc.training.train_mnist_pc:main"
 pcdc-continual = "pcdc.training.continual_runner:main"
+pcdc-depth-time = "pcdc.training.depth_time_experiment:main_cli"
 
 [dependency-groups]
 dev = [
