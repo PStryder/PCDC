@@ -34,6 +34,7 @@ class PCDCMetadata(BaseModel):
     converged: bool
     adjusted_temperature: float
     settle_steps: int
+    cosine_distance: float | None = None  # embedding distance to previous turn
     retrieval_triggered: bool = False
     retrieval_count: int = 0
 

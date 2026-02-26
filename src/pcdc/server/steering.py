@@ -27,6 +27,7 @@ class SteeringResult:
     predictive_energy: float                # Phase 2
     converged: bool
     settle_steps: int
+    cosine_distance: float | None = None    # distance to previous embedding
     steering_vector: Tensor | None = None
     retrieval_triggered: bool = False
     retrieval_count: int = 0
@@ -40,6 +41,7 @@ class SteeringStats:
     energy_median: float = 0.0
     recon_energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     predict_energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    cosine_distance_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     retrieval_triggered_total: int = 0
 
 
@@ -62,10 +64,12 @@ class SteeringEngine:
         beta: float = 0.5,
         online_eta_w: float = 0.0001,
         replay_k: int = 4,
+        settle_k: int | None = None,
         # MemoryGate retrieval
         memory_client: Any = None,
         retrieval_recon_threshold: float = float("inf"),
         retrieval_predict_threshold: float = float("inf"),
+        retrieval_predict_percentile: float | None = None,
         retrieval_limit: int = 3,
         retrieval_min_confidence: float = 0.5,
         format_prompt_fn: Callable | None = None,
@@ -79,11 +83,13 @@ class SteeringEngine:
         self.beta = beta
         self.online_eta_w = online_eta_w
         self.replay_k = replay_k
+        self.settle_k = settle_k
 
         # MemoryGate retrieval
         self._memory_client = memory_client
         self._retrieval_recon_threshold = retrieval_recon_threshold
         self._retrieval_predict_threshold = retrieval_predict_threshold
+        self._retrieval_predict_percentile = retrieval_predict_percentile
         self._retrieval_limit = retrieval_limit
         self._retrieval_min_confidence = retrieval_min_confidence
         self._format_prompt_fn = format_prompt_fn
@@ -191,9 +197,22 @@ class SteeringEngine:
             device = next(self.pc_head.parameters()).device
             x_input = embedding.unsqueeze(0).to(device)
 
-            # --- Save and swap learning rate ---
+            # --- Cosine distance to previous embedding ---
+            cosine_dist = None
+            if self._prev_embedding is not None:
+                prev_flat = self._prev_embedding.to(device).float()
+                curr_flat = embedding.to(device).float()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    prev_flat.unsqueeze(0), curr_flat.unsqueeze(0),
+                ).item()
+                cosine_dist = 1.0 - cos_sim
+
+            # --- Save and swap learning rate + settle steps ---
             original_eta_w = self.pc_head.config.eta_w
+            original_K = self.pc_head.config.K
             self.pc_head.config.eta_w = self.online_eta_w
+            if self.settle_k is not None:
+                self.pc_head.config.K = self.settle_k
 
             # --- Phase 1: Reconstruction settle ---
             recon_batch = [x_input]
@@ -227,8 +246,9 @@ class SteeringEngine:
                 total_steps = recon_metrics["settle_steps"]
                 converged = recon_metrics["converged"]
 
-            # --- Restore learning rate ---
+            # --- Restore learning rate + settle steps ---
             self.pc_head.config.eta_w = original_eta_w
+            self.pc_head.config.K = original_K
 
             # --- Blend energies ---
             energy = self.beta * e_recon + (1.0 - self.beta) * e_predict
@@ -238,13 +258,24 @@ class SteeringEngine:
             retrieval_count = 0
             retrieval_query = None
 
+            # Compute dynamic predict threshold from percentile if configured
+            predict_threshold = self._retrieval_predict_threshold
+            if (
+                self._retrieval_predict_percentile is not None
+                and len(self.stats.predict_energy_history) >= 3
+            ):
+                predict_threshold = self._compute_percentile(
+                    self.stats.predict_energy_history,
+                    self._retrieval_predict_percentile,
+                )
+
             if (
                 self._memory_client is not None
                 and self._format_prompt_fn is not None
                 and messages is not None
                 and (
                     e_recon > self._retrieval_recon_threshold
-                    or e_predict > self._retrieval_predict_threshold
+                    or e_predict > predict_threshold
                 )
             ):
                 retrieval_query = _extract_last_user_content(messages)
@@ -276,6 +307,8 @@ class SteeringEngine:
             self.stats.energy_history.append(energy)
             self.stats.recon_energy_history.append(e_recon)
             self.stats.predict_energy_history.append(e_predict)
+            if cosine_dist is not None:
+                self.stats.cosine_distance_history.append(cosine_dist)
             self.stats.energy_median = self._compute_median()
 
             # Energy → temperature
@@ -286,9 +319,12 @@ class SteeringEngine:
 
             logger.info(
                 "steer_and_generate: e_recon=%.4f e_predict=%.4f blended=%.4f "
-                "median=%.4f base=%.2f adj=%.3f converged=%s steps=%d retrieval=%s",
+                "median=%.4f base=%.2f adj=%.3f converged=%s steps=%d "
+                "cos_dist=%s retrieval=%s",
                 e_recon, e_predict, energy, median, base_temp, adjusted,
-                converged, total_steps, retrieval_triggered,
+                converged, total_steps,
+                f"{cosine_dist:.6f}" if cosine_dist is not None else "N/A",
+                retrieval_triggered,
             )
 
             steering = SteeringResult(
@@ -298,6 +334,7 @@ class SteeringEngine:
                 predictive_energy=e_predict,
                 converged=converged,
                 settle_steps=total_steps,
+                cosine_distance=cosine_dist,
                 steering_vector=steering_vector.squeeze(0),
                 retrieval_triggered=retrieval_triggered,
                 retrieval_count=retrieval_count,
@@ -353,6 +390,7 @@ class SteeringEngine:
             "stats_energy_median": self.stats.energy_median,
             "stats_recon_energy_history": list(self.stats.recon_energy_history),
             "stats_predict_energy_history": list(self.stats.predict_energy_history),
+            "stats_cosine_distance_history": list(self.stats.cosine_distance_history),
             "prev_embedding": self._prev_embedding,
             "prompt_replay": self._prompt_replay,
             "prompt_pair_replay": self._prompt_pair_replay,
@@ -374,6 +412,8 @@ class SteeringEngine:
         self.stats.recon_energy_history = deque(recon_history, maxlen=1000)
         predict_history = data.get("stats_predict_energy_history", [])
         self.stats.predict_energy_history = deque(predict_history, maxlen=1000)
+        cosine_history = data.get("stats_cosine_distance_history", [])
+        self.stats.cosine_distance_history = deque(cosine_history, maxlen=1000)
         self._prev_embedding = data.get("prev_embedding", None)
         self._prompt_replay = data.get("prompt_replay", [])
         self._prompt_pair_replay = data.get("prompt_pair_replay", [])
@@ -390,6 +430,10 @@ class SteeringEngine:
             "pair_replay_size": len(self._prompt_pair_replay),
             "energy_history_len": len(self.stats.energy_history),
             "retrieval_triggered_total": self.stats.retrieval_triggered_total,
+            # Full histories for plotting
+            "recon_energy_history": list(self.stats.recon_energy_history),
+            "predict_energy_history": list(self.stats.predict_energy_history),
+            "cosine_distance_history": list(self.stats.cosine_distance_history),
         }
 
     def _compute_median(self) -> float:
@@ -404,6 +448,21 @@ class SteeringEngine:
         if n % 2 == 1:
             return vals[n // 2]
         return (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+
+    @staticmethod
+    def _compute_percentile(history: deque, percentile: float) -> float:
+        """Compute a percentile value from a deque of floats."""
+        if not history:
+            return float("inf")
+        vals = sorted(history)
+        n = len(vals)
+        idx = (percentile / 100.0) * (n - 1)
+        lo = int(math.floor(idx))
+        hi = int(math.ceil(idx))
+        if lo == hi:
+            return vals[lo]
+        frac = idx - lo
+        return vals[lo] * (1.0 - frac) + vals[hi] * frac
 
 
 def _extract_last_user_content(messages: list[dict]) -> str | None:

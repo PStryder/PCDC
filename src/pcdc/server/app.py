@@ -47,12 +47,14 @@ class ServerConfig:
     pc_beta: float = 0.5
     pc_online_eta_w: float = 0.0001
     pc_replay_k: int = 4
+    pc_settle_k: int | None = None
     # MemoryGate retrieval
     mg_url: str | None = None
     mg_timeout: float = 2.0
     mg_bearer_token: str | None = None
     mg_recon_threshold: float = float("inf")
     mg_predict_threshold: float = float("inf")
+    mg_predict_percentile: float | None = None
     mg_retrieval_limit: int = 3
     mg_retrieval_min_confidence: float = 0.5
 
@@ -146,9 +148,11 @@ def create_app(config: ServerConfig) -> FastAPI:
             beta=config.pc_beta,
             online_eta_w=config.pc_online_eta_w,
             replay_k=config.pc_replay_k,
+            settle_k=config.pc_settle_k,
             memory_client=memory_client,
             retrieval_recon_threshold=config.mg_recon_threshold,
             retrieval_predict_threshold=config.mg_predict_threshold,
+            retrieval_predict_percentile=config.mg_predict_percentile,
             retrieval_limit=config.mg_retrieval_limit,
             retrieval_min_confidence=config.mg_retrieval_min_confidence,
             format_prompt_fn=format_augmented_prompt if memory_client else None,
@@ -247,6 +251,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 converged=steering.converged,
                 adjusted_temperature=steering.adjusted_temp,
                 settle_steps=steering.settle_steps,
+                cosine_distance=steering.cosine_distance,
                 retrieval_triggered=steering.retrieval_triggered,
                 retrieval_count=steering.retrieval_count,
             )
@@ -403,12 +408,14 @@ def main():
     parser.add_argument("--pc-beta", type=float, default=0.5, help="Blend ratio: energy = beta*E_recon + (1-beta)*E_predict (default: 0.5)")
     parser.add_argument("--pc-online-eta-w", type=float, default=0.0001, help="Online learning rate for train_step phases (default: 0.0001)")
     parser.add_argument("--pc-replay-k", type=int, default=4, help="Replay samples per training phase (default: 4)")
+    parser.add_argument("--pc-settle-k", type=int, default=None, help="Override settle steps per phase (default: PCHead config K)")
     # MemoryGate retrieval
     parser.add_argument("--mg-url", default=None, help="MemoryGate MCP endpoint URL (enables retrieval)")
     parser.add_argument("--mg-timeout", type=float, default=2.0, help="MemoryGate request timeout in seconds (default: 2.0)")
     parser.add_argument("--mg-bearer-token", default=None, help="Bearer token for MemoryGate auth")
     parser.add_argument("--mg-recon-threshold", type=float, default=float("inf"), help="Reconstruction energy threshold for retrieval (default: disabled)")
     parser.add_argument("--mg-predict-threshold", type=float, default=float("inf"), help="Predictive energy threshold for retrieval (default: disabled)")
+    parser.add_argument("--mg-predict-percentile", type=float, default=None, help="Dynamic retrieval threshold as percentile of predict energy history (e.g., 95)")
     parser.add_argument("--mg-retrieval-limit", type=int, default=3, help="Max memory items to retrieve (default: 3)")
     parser.add_argument("--mg-retrieval-min-confidence", type=float, default=0.5, help="Min confidence for retrieved memories (default: 0.5)")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
@@ -432,11 +439,13 @@ def main():
         pc_beta=args.pc_beta,
         pc_online_eta_w=args.pc_online_eta_w,
         pc_replay_k=args.pc_replay_k,
+        pc_settle_k=args.pc_settle_k,
         mg_url=args.mg_url,
         mg_timeout=args.mg_timeout,
         mg_bearer_token=args.mg_bearer_token,
         mg_recon_threshold=args.mg_recon_threshold,
         mg_predict_threshold=args.mg_predict_threshold,
+        mg_predict_percentile=args.mg_predict_percentile,
         mg_retrieval_limit=args.mg_retrieval_limit,
         mg_retrieval_min_confidence=args.mg_retrieval_min_confidence,
     )
