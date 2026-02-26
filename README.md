@@ -6,7 +6,7 @@ Three tiers:
 
 1. **Core PCNetwork** — MLP-shaped predictive coding network benchmarked on MNIST
 2. **GGUF PCHead** — Frozen LLM (via GGUF) as feature extractor + lightweight PC classifier for continual learning
-3. **Chat API Server** — OpenAI-compatible API where PCHead settling dynamics steer LLM generation: two-phase online learning produces reconstruction and predictive energy signals, which drive temperature modulation and autonomous memory retrieval via MemoryGate
+3. **Chat API Server** — OpenAI-compatible API where PCHead settling dynamics steer LLM generation: two-phase online learning produces reconstruction energy, predictive energy, and cosine distance signals, which drive temperature modulation and autonomous memory retrieval via MemoryGate
 
 ## How It Works
 
@@ -119,6 +119,9 @@ src/pcdc/
 │   ├── steering.py                # SteeringEngine — two-phase settling, retrieval gate, temperature mapping
 │   ├── memory_client.py           # Sync httpx client for MemoryGate MCP JSON-RPC
 │   └── schemas.py                 # Pydantic models (request/response/SSE)
+│
+├── scripts/
+│   └── plot_session.py            # Plot energy histories + cosine distances from server stats
 │
 ├── training/                      # Training loops and evaluation
 │   ├── train_mnist_pc.py          # PC training loop on MNIST
@@ -236,12 +239,13 @@ An OpenAI-compatible chat API where the PCHead acts as the conversation's execut
 
 ### Two-Phase Settling
 
-Each request triggers two `train_step()` calls with a conservative online learning rate (`eta_w=0.0001`, 10x smaller than offline default):
+Each request triggers two `train_step()` calls with a conservative online learning rate (recommended `eta_w=0.00001`):
 
 1. **Phase 1 — Reconstruction**: `train_step(embedding, embedding)` → reconstruction energy `E_recon`. Measures how novel this content is (self-reconstruction difficulty).
 2. **Phase 2 — Predictive**: `train_step(prev_embedding, current_embedding)` → predictive energy `E_predict`. Measures how surprising this transition is from the previous turn.
+3. **Cosine Distance**: `1 - cos_sim(prev_embedding, current_embedding)` — raw embedding-space distance between consecutive turns, independent of PCHead learning state.
 
-Both phases mix in replay samples (configurable `replay_k`) from prompt embedding buffers to prevent catastrophic forgetting. On the first turn, Phase 2 is skipped and `E_predict = E_recon`.
+Both phases mix in replay samples (configurable `replay_k`) from prompt embedding buffers to prevent catastrophic forgetting. Settle steps per phase are configurable via `--pc-settle-k` (default: PCHead config K=20, recommended: 50-100). On the first turn, Phase 2 is skipped and `E_predict = E_recon`.
 
 The blended energy drives temperature:
 
@@ -252,16 +256,20 @@ temp = base_temp * (1 + α * tanh((energy - median) / scale))
 
 After both training phases, `infer()` runs on the updated weights to produce a steering vector (available for future logit biasing).
 
+**Tuning insight:** At `eta_w=1e-4`, energy declines monotonically (~17% over 8 turns) regardless of topic shifts — the network adapts faster than novelty can register. At `eta_w=1e-5`, decline is only ~2.5% over 12 turns, energy responds to domain shifts, and temperature actually varies (0.35–1.05 vs stuck at 0.35). See `docs/session2_energy_plot.png` for the comparison.
+
 ### Energy-Triggered Memory Retrieval
 
 When either energy exceeds its threshold, the steering engine autonomously queries MemoryGate for relevant context — the PCHead decides when to retrieve, not the LLM:
 
 ```
-if E_recon > threshold or E_predict > threshold:
+if E_recon > recon_threshold or E_predict > predict_threshold:
     results = memorygate.search(last_user_message)
     inject results as system context
     re-embed augmented prompt (refreshes KV cache)
 ```
+
+Thresholds can be absolute values or **dynamic percentiles** — `--mg-predict-percentile 95` triggers retrieval when predictive energy exceeds the 95th percentile of the session's history, adapting to the model's energy distribution automatically.
 
 The LLM just sees a longer prompt with relevant context prepended. It doesn't know why the context appeared. This inverts the typical RAG architecture: settling dynamics drive retrieval, the LLM is purely downstream.
 
@@ -281,14 +289,15 @@ uv run pcdc-serve \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead.ckpt
 
-# With MemoryGate retrieval
+# With MemoryGate retrieval + tuned parameters
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead.ckpt \
+    --pc-online-eta-w 0.00001 \
+    --pc-settle-k 100 \
     --mg-url http://localhost:8080/mcp \
-    --mg-recon-threshold 2.5 \
-    --mg-predict-threshold 3.0
+    --mg-predict-percentile 95
 
 # Chat via curl
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -312,14 +321,15 @@ Responses include a `pcdc` metadata field:
 
 ```json
 {
-  "settling_energy": 1.234,
-  "reconstruction_energy": 1.45,
-  "predictive_energy": 1.02,
-  "converged": true,
-  "adjusted_temperature": 0.87,
-  "settle_steps": 14,
-  "retrieval_triggered": true,
-  "retrieval_count": 3
+  "settling_energy": 10090.5,
+  "reconstruction_energy": 10172.3,
+  "predictive_energy": 10008.7,
+  "converged": false,
+  "adjusted_temperature": 0.35,
+  "settle_steps": 200,
+  "cosine_distance": 0.280,
+  "retrieval_triggered": false,
+  "retrieval_count": 0
 }
 ```
 
@@ -343,13 +353,15 @@ uv run pcdc-serve \
     --pc-energy-scale 1.0           # Energy normalization scale
     --pc-checkpoint PATH            # Save/load PCHead state + replay buffers
     --pc-beta 0.5                   # Blend ratio: energy = β*E_recon + (1-β)*E_predict
-    --pc-online-eta-w 0.0001        # Online learning rate (default: 0.0001)
+    --pc-online-eta-w 0.00001       # Online learning rate (recommended: 1e-5)
     --pc-replay-k 4                 # Replay samples per training phase
+    --pc-settle-k 100               # Settle steps per phase (default: PCHead K)
     --mg-url URL                    # MemoryGate MCP endpoint (enables retrieval)
     --mg-timeout 2.0                # MemoryGate request timeout in seconds
     --mg-bearer-token TOKEN         # Bearer token for MemoryGate auth
     --mg-recon-threshold INF        # Reconstruction energy retrieval threshold
     --mg-predict-threshold INF      # Predictive energy retrieval threshold
+    --mg-predict-percentile 95      # Dynamic predict threshold as percentile of history
     --mg-retrieval-limit 3          # Max memory items to retrieve
     --mg-retrieval-min-confidence 0.5  # Min confidence for retrieved memories
     --log-level INFO                # Log level
@@ -456,14 +468,15 @@ uv run pcdc-serve \
     --pc-checkpoint pchead.ckpt \
     --port 8000
 
-# Chat API server (with MemoryGate retrieval)
+# Chat API server (with MemoryGate retrieval + tuned parameters)
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead.ckpt \
+    --pc-online-eta-w 0.00001 \
+    --pc-settle-k 100 \
     --mg-url http://localhost:8080/mcp \
-    --mg-recon-threshold 2.5 \
-    --mg-predict-threshold 3.0
+    --mg-predict-percentile 95
 ```
 
 ## Status
@@ -477,13 +490,16 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Continual learning pipeline with replay and forgetting metrics
 - Weight alignment diagnostic confirms PC ≈ backprop for linear case
 - Two-phase online learning (reconstruction + predictive) during generation
-- Dual energy signals: content novelty (E_recon) and conversation dynamics (E_predict)
-- Energy-triggered autonomous memory retrieval via MemoryGate
+- Three complementary signals: E_recon (content novelty), E_predict (transition surprise), cosine distance (embedding geometry)
+- Energy-triggered autonomous memory retrieval via MemoryGate with dynamic percentile thresholds
+- Configurable settle steps per phase (K override for online learning vs offline)
 - Replay buffer mixing in both training phases to prevent catastrophic forgetting
 - PCHead checkpoint save/load with full replay state across server restarts
+- Plotting script for energy and cosine distance visualization (`scripts/plot_session.py`)
+- Validated across two live sessions: eta_w=1e-5 preserves novelty sensitivity over 12+ turns
 
 **What's next:**
-- Median-relative retrieval thresholds (adaptive instead of absolute)
+- Cosine distance as third retrieval gate signal (high cos_dist = domain shift)
 - v2 steering: project steering vector → logit bias via LLM embedding matrix
 - Run MNIST to convergence and tune hyperparameters for >90% accuracy
 - End-to-end GGUF continual learning with a real model
