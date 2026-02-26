@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import time
@@ -42,6 +43,7 @@ class ServerConfig:
     pc_hidden_sizes: list[int] | None = None
     pc_alpha: float = 0.5
     pc_energy_scale: float = 1.0
+    pc_checkpoint: str | None = None
 
 
 # Llama-3 chat template
@@ -102,14 +104,33 @@ def create_app(config: ServerConfig) -> FastAPI:
             energy_scale=config.pc_energy_scale,
         )
 
+        # Load checkpoint if provided
+        if config.pc_checkpoint:
+            from pathlib import Path
+            if Path(config.pc_checkpoint).exists():
+                engine.load_checkpoint(config.pc_checkpoint)
+            else:
+                logger.info("No checkpoint at %s — starting fresh", config.pc_checkpoint)
+
         state["backend"] = backend
         state["engine"] = engine
         state["config"] = config
 
+        # atexit fallback — Windows doesn't reliably fire lifespan shutdown
+        if config.pc_checkpoint:
+            def _save_on_exit():
+                try:
+                    engine.save_checkpoint(config.pc_checkpoint)
+                except Exception:
+                    pass
+            atexit.register(_save_on_exit)
+
         logger.info("PCDC server ready on %s:%d", config.host, config.port)
         yield
 
-        # --- Shutdown ---
+        # --- Shutdown: save checkpoint ---
+        if config.pc_checkpoint:
+            engine.save_checkpoint(config.pc_checkpoint)
         logger.info("Shutting down PCDC server")
 
     app = FastAPI(title="PCDC Chat API", lifespan=lifespan)
@@ -279,6 +300,18 @@ def create_app(config: ServerConfig) -> FastAPI:
         engine = state["engine"]
         return engine.get_stats()
 
+    @app.post("/v1/pcdc/checkpoint")
+    async def pcdc_checkpoint():
+        cfg = state["config"]
+        if not cfg.pc_checkpoint:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "no_checkpoint_path", "message": "Server started without --pc-checkpoint."},
+            )
+        engine = state["engine"]
+        await asyncio.to_thread(engine.save_checkpoint, cfg.pc_checkpoint)
+        return {"status": "saved", "path": cfg.pc_checkpoint}
+
     @app.post("/v1/pcdc/train")
     async def pcdc_train():
         return JSONResponse(
@@ -300,6 +333,7 @@ def main():
     parser.add_argument("--n-gpu-layers", type=int, default=0, help="GPU offload layers")
     parser.add_argument("--pc-alpha", type=float, default=0.5, help="Energy-temperature coupling strength")
     parser.add_argument("--pc-energy-scale", type=float, default=1.0, help="Energy normalization scale")
+    parser.add_argument("--pc-checkpoint", default=None, help="Path to save/load PCHead checkpoint (auto-saves on shutdown)")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
     args = parser.parse_args()
 
@@ -317,6 +351,7 @@ def main():
         n_gpu_layers=args.n_gpu_layers,
         pc_alpha=args.pc_alpha,
         pc_energy_scale=args.pc_energy_scale,
+        pc_checkpoint=args.pc_checkpoint,
     )
 
     import uvicorn

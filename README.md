@@ -2,10 +2,11 @@
 
 A predictive coding network implemented as a stateful dynamical system in PyTorch. No backprop in the inner loop — learning emerges from local Hebbian-like weight updates driven by prediction error minimization.
 
-Two tiers:
+Three tiers:
 
 1. **Core PCNetwork** — MLP-shaped predictive coding network benchmarked on MNIST
 2. **GGUF PCHead** — Frozen LLM (via GGUF) as feature extractor + lightweight PC classifier for continual learning
+3. **Chat API Server** — OpenAI-compatible API where PCHead settling energy steers LLM generation temperature
 
 ## How It Works
 
@@ -45,6 +46,9 @@ uv sync                        # core deps (torch, torchvision, etc.)
 
 # Optional: GGUF backend for frozen LLM features
 uv sync --extra gguf           # adds llama-cpp-python
+
+# Optional: Chat API server
+uv sync --extra server         # adds fastapi, uvicorn, sse-starlette
 
 # Dev tools
 uv sync --group dev            # adds pytest, pytest-cov
@@ -105,10 +109,15 @@ src/pcdc/
 │   └── clamp.py                   # ClampMode enum + mask generation
 │
 ├── gguf/                          # Frozen LLM feature extraction tier
-│   ├── gguf_backend.py            # GGUF loading via llama-cpp-python
+│   ├── gguf_backend.py            # GGUF loading + embed_chat() for serving
 │   ├── pc_head.py                 # PCHead — thin PCNetwork subclass
 │   ├── datasets.py                # Split-class + template-shift task sequences
 │   └── baselines.py               # Linear probe, SGD MLP, replay buffer
+│
+├── server/                        # OpenAI-compatible chat API
+│   ├── app.py                     # FastAPI app, routes, CLI entry point
+│   ├── steering.py                # SteeringEngine — energy→temperature mapping
+│   └── schemas.py                 # Pydantic models (request/response/SSE)
 │
 ├── training/                      # Training loops and evaluation
 │   ├── train_mnist_pc.py          # PC training loop on MNIST
@@ -220,6 +229,67 @@ Tasks are presented sequentially. After training on each task, all models are ev
 - Forgetting: `max(A[t..T][t]) - A[T][t]` for each task t
 - Average final accuracy across all tasks
 
+## Chat API Server
+
+An OpenAI-compatible chat API that uses PCHead settling dynamics to steer LLM generation. Before each completion, the server embeds the prompt, runs PCHead settling, and uses the resulting energy to modulate temperature:
+
+```
+temp = base_temp * (1 + α * tanh((energy - median) / scale))
+```
+
+High energy (uncertain settling) → higher temperature → more exploratory output. Low energy (confident settling) → lower temperature → more focused output.
+
+### Quick Start
+
+```bash
+uv sync --extra server
+
+# Start the server
+uv run pcdc-serve \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --pc-checkpoint pchead.ckpt
+
+# Chat via curl
+curl -X POST http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+Any OpenAI-compatible frontend can connect to `http://localhost:8000/v1`.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
+| `/v1/models` | GET | List available models |
+| `/v1/pcdc/stats` | GET | Steering statistics (energy median, request count, replay buffer size) |
+| `/v1/pcdc/checkpoint` | POST | Save PCHead weights + stats to disk |
+| `/v1/pcdc/train` | POST | Online training trigger (placeholder, returns 501) |
+
+Responses include a `pcdc` metadata field with settling energy, convergence status, adjusted temperature, and settle steps. Standard OpenAI clients ignore this field.
+
+### Checkpointing
+
+Pass `--pc-checkpoint path/to/pchead.ckpt` to persist PCHead weights and steering stats across restarts. The checkpoint is loaded on startup (if the file exists) and saved on shutdown. Use `POST /v1/pcdc/checkpoint` for explicit saves.
+
+### Server Options
+
+```bash
+uv run pcdc-serve \
+    --model MODEL_PATH          # Required: path to GGUF model
+    --host 0.0.0.0              # Bind address (default: 0.0.0.0)
+    --port 8000                 # Port (default: 8000)
+    --n-ctx 4096                # Context window size
+    --n-threads 8               # CPU threads
+    --n-gpu-layers 0            # GPU offload layers (0 = CPU only)
+    --pc-alpha 0.5              # Energy-temperature coupling strength
+    --pc-energy-scale 1.0       # Energy normalization scale
+    --pc-checkpoint PATH        # Save/load PCHead state
+    --log-level INFO            # Log level
+```
+
 ## Configuration Reference
 
 ### PCConfig
@@ -313,6 +383,13 @@ uv run pcdc-continual \
     --device cuda \
     --seed 42 \
     --output-dir ./experiments
+
+# Chat API server
+uv run pcdc-serve \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --pc-checkpoint pchead.ckpt \
+    --port 8000
 ```
 
 ## Status
@@ -325,8 +402,12 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Oscillation detection + adaptive damping stabilize settling
 - Continual learning pipeline with replay and forgetting metrics
 - Weight alignment diagnostic confirms PC ≈ backprop for linear case
+- Chat API server with energy-based temperature steering
+- PCHead checkpoint save/load across server restarts
 
 **What's next:**
+- PCHead training on conversation embeddings (needs quality signal design)
+- v2 steering: project steering vector → logit bias via LLM embedding matrix
 - Run MNIST to convergence and tune hyperparameters for >90% accuracy
 - End-to-end GGUF continual learning with a real model
 - Benchmark forgetting: PCHead vs baselines across task sequences

@@ -108,6 +108,30 @@ class SteeringEngine:
         if len(self._replay) < self._replay_max:
             self._replay.append(embedding)
 
+    def save_checkpoint(self, path: str) -> None:
+        """Save PCHead weights and steering stats to disk."""
+        import torch
+        data = {
+            "pc_head_state_dict": self.pc_head.state_dict(),
+            "stats_total_requests": self.stats.total_requests,
+            "stats_energy_history": list(self.stats.energy_history),
+            "stats_energy_median": self.stats.energy_median,
+        }
+        torch.save(data, path)
+        logger.info("Checkpoint saved to %s (%d requests)", path, self.stats.total_requests)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load PCHead weights and steering stats from disk."""
+        import torch
+        data = torch.load(path, weights_only=False)
+        self.pc_head.load_state_dict(data["pc_head_state_dict"])
+        self.pc_head.eval()
+        self.stats.total_requests = data.get("stats_total_requests", 0)
+        history = data.get("stats_energy_history", [])
+        self.stats.energy_history = deque(history, maxlen=1000)
+        self.stats.energy_median = data.get("stats_energy_median", 0.0)
+        logger.info("Checkpoint loaded from %s (%d prior requests)", path, self.stats.total_requests)
+
     def get_stats(self) -> dict:
         return {
             "total_requests": self.stats.total_requests,
