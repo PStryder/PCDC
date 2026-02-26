@@ -28,10 +28,14 @@ class ChatCompletionRequest(BaseModel):
 # --- PCDC metadata (extra field, ignored by standard frontends) ---
 
 class PCDCMetadata(BaseModel):
-    settling_energy: float
+    settling_energy: float          # blended energy (used for temperature)
+    reconstruction_energy: float    # Phase 1 energy
+    predictive_energy: float        # Phase 2 energy
     converged: bool
     adjusted_temperature: float
     settle_steps: int
+    retrieval_triggered: bool = False
+    retrieval_count: int = 0
 
 
 # --- Non-streaming response ---

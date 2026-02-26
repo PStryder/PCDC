@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 import torch
 from torch import Tensor
@@ -21,10 +22,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SteeringResult:
     adjusted_temp: float
-    energy: float
+    energy: float                           # blended
+    reconstruction_energy: float            # Phase 1
+    predictive_energy: float                # Phase 2
     converged: bool
     settle_steps: int
     steering_vector: Tensor | None = None
+    retrieval_triggered: bool = False
+    retrieval_count: int = 0
+    retrieval_query: str | None = None
 
 
 @dataclass
@@ -32,6 +38,9 @@ class SteeringStats:
     total_requests: int = 0
     energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     energy_median: float = 0.0
+    recon_energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    predict_energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+    retrieval_triggered_total: int = 0
 
 
 class SteeringEngine:
@@ -50,6 +59,16 @@ class SteeringEngine:
         energy_scale: float = 1.0,
         temp_min: float = 0.1,
         temp_max: float = 2.0,
+        beta: float = 0.5,
+        online_eta_w: float = 0.0001,
+        replay_k: int = 4,
+        # MemoryGate retrieval
+        memory_client: Any = None,
+        retrieval_recon_threshold: float = float("inf"),
+        retrieval_predict_threshold: float = float("inf"),
+        retrieval_limit: int = 3,
+        retrieval_min_confidence: float = 0.5,
+        format_prompt_fn: Callable | None = None,
     ):
         self.backend = backend
         self.pc_head = pc_head
@@ -57,13 +76,29 @@ class SteeringEngine:
         self.energy_scale = energy_scale
         self.temp_min = temp_min
         self.temp_max = temp_max
+        self.beta = beta
+        self.online_eta_w = online_eta_w
+        self.replay_k = replay_k
+
+        # MemoryGate retrieval
+        self._memory_client = memory_client
+        self._retrieval_recon_threshold = retrieval_recon_threshold
+        self._retrieval_predict_threshold = retrieval_predict_threshold
+        self._retrieval_limit = retrieval_limit
+        self._retrieval_min_confidence = retrieval_min_confidence
+        self._format_prompt_fn = format_prompt_fn
 
         self._lock = threading.Lock()
         self.stats = SteeringStats()
 
-        # Replay buffer for future online learning
+        # Replay buffer for record() (completion embeddings)
         self._replay: list[Tensor] = []
         self._replay_max = 10_000
+
+        # Two-phase replay buffers (prompt embeddings)
+        self._prev_embedding: Tensor | None = None
+        self._prompt_replay: list[Tensor] = []
+        self._prompt_pair_replay: list[tuple[Tensor, Tensor]] = []
 
     def steer(self, prompt_text: str, base_temp: float = 1.0) -> SteeringResult:
         """Run PCHead settling on prompt embedding, return steering result."""
@@ -97,6 +132,8 @@ class SteeringEngine:
         return SteeringResult(
             adjusted_temp=adjusted,
             energy=energy,
+            reconstruction_energy=energy,
+            predictive_energy=energy,
             converged=metrics.converged,
             settle_steps=metrics.steps_used,
             steering_vector=steering_vector.squeeze(0),
@@ -106,13 +143,26 @@ class SteeringEngine:
         self,
         prompt_text: str,
         base_temp: float = 1.0,
+        messages: list[dict] | None = None,
         **completion_kwargs: Any,
     ) -> tuple[SteeringResult, Any]:
-        """Atomic embed → steer → generate with KV-cache reuse.
+        """Atomic embed → two-phase settle → retrieval gate → infer → generate.
+
+        Phase 1 (Reconstruction): train_step(embedding, embedding)
+            → How novel is this content? (self-reconstruction energy)
+
+        Phase 2 (Predictive): train_step(prev_embedding, current_embedding)
+            → How surprising is this transition? (predictive energy)
+
+        Retrieval Gate: if either energy exceeds its threshold, query
+        MemoryGate for relevant context, inject it into the prompt, and
+        re-embed to get new generation tokens (KV cache refreshed).
+
+        Both training phases use a conservative online learning rate and
+        mix in replay samples to prevent catastrophic forgetting.
 
         Holds ``self._lock`` for the entire sequence so the warm KV cache
-        from ``embed_and_warm`` is still intact when ``create_completion``
-        runs, giving it a prefix hit that skips prompt re-processing.
+        is still intact when ``create_completion`` runs.
 
         For streaming (``stream=True`` in *completion_kwargs*), the returned
         iterator wrapper keeps the lock held until the stream is exhausted.
@@ -121,6 +171,9 @@ class SteeringEngine:
             prompt_text: Fully-formatted prompt (Llama-3 template already
                 applied).
             base_temp: Base temperature before energy modulation.
+            messages: Raw message dicts (``[{"role":..,"content":..}]``)
+                for prompt reconstruction on retrieval. Optional — if not
+                provided, retrieval gate is skipped.
             **completion_kwargs: Forwarded to
                 ``backend.llm.create_completion()`` — include ``top_p``,
                 ``max_tokens``, ``stop``, ``stream``, etc.
@@ -135,16 +188,94 @@ class SteeringEngine:
             embedding, tokens = self.backend.embed_and_warm(prompt_text)
 
             # PCHead expects (B, feature_dim)
-            x_input = embedding.unsqueeze(0).to(next(self.pc_head.parameters()).device)
+            device = next(self.pc_head.parameters()).device
+            x_input = embedding.unsqueeze(0).to(device)
 
+            # --- Save and swap learning rate ---
+            original_eta_w = self.pc_head.config.eta_w
+            self.pc_head.config.eta_w = self.online_eta_w
+
+            # --- Phase 1: Reconstruction settle ---
+            recon_batch = [x_input]
+            if self._prompt_replay:
+                k = min(self.replay_k, len(self._prompt_replay))
+                samples = random.sample(self._prompt_replay, k)
+                recon_batch.extend(s.unsqueeze(0).to(device) for s in samples)
+            recon_input = torch.cat(recon_batch, dim=0)
+            recon_metrics = self.pc_head.train_step(recon_input, recon_input)
+            e_recon = recon_metrics["energy"]
+
+            # --- Phase 2: Predictive settle ---
+            if self._prev_embedding is not None:
+                prev = self._prev_embedding.unsqueeze(0).to(device)
+                pred_prev_batch = [prev]
+                pred_curr_batch = [x_input]
+                if self._prompt_pair_replay:
+                    k = min(self.replay_k, len(self._prompt_pair_replay))
+                    pairs = random.sample(self._prompt_pair_replay, k)
+                    for p, c in pairs:
+                        pred_prev_batch.append(p.unsqueeze(0).to(device))
+                        pred_curr_batch.append(c.unsqueeze(0).to(device))
+                pred_input = torch.cat(pred_prev_batch, dim=0)
+                pred_target = torch.cat(pred_curr_batch, dim=0)
+                pred_metrics = self.pc_head.train_step(pred_input, pred_target)
+                e_predict = pred_metrics["energy"]
+                total_steps = recon_metrics["settle_steps"] + pred_metrics["settle_steps"]
+                converged = recon_metrics["converged"] and pred_metrics["converged"]
+            else:
+                e_predict = e_recon
+                total_steps = recon_metrics["settle_steps"]
+                converged = recon_metrics["converged"]
+
+            # --- Restore learning rate ---
+            self.pc_head.config.eta_w = original_eta_w
+
+            # --- Blend energies ---
+            energy = self.beta * e_recon + (1.0 - self.beta) * e_predict
+
+            # --- Retrieval gate ---
+            retrieval_triggered = False
+            retrieval_count = 0
+            retrieval_query = None
+
+            if (
+                self._memory_client is not None
+                and self._format_prompt_fn is not None
+                and messages is not None
+                and (
+                    e_recon > self._retrieval_recon_threshold
+                    or e_predict > self._retrieval_predict_threshold
+                )
+            ):
+                retrieval_query = _extract_last_user_content(messages)
+                if retrieval_query:
+                    results = self._memory_client.search(
+                        query=retrieval_query,
+                        limit=self._retrieval_limit,
+                        min_confidence=self._retrieval_min_confidence,
+                    )
+                    if results:
+                        retrieval_triggered = True
+                        retrieval_count = len(results)
+                        self.stats.retrieval_triggered_total += 1
+                        # Rebuild prompt with injected context, re-embed
+                        augmented_prompt = self._format_prompt_fn(messages, results)
+                        _, tokens = self.backend.embed_and_warm(augmented_prompt)
+                        logger.info(
+                            "retrieval: triggered (e_recon=%.4f e_predict=%.4f), "
+                            "injected %d memory items for query=%r",
+                            e_recon, e_predict, retrieval_count, retrieval_query[:80],
+                        )
+
+            # --- Infer for steering vector (on updated weights, original embedding) ---
             with torch.no_grad():
-                steering_vector, metrics = self.pc_head.infer(x_input)
-
-            energy = metrics.final_energy
+                steering_vector, infer_metrics = self.pc_head.infer(x_input)
 
             # Update running stats
             self.stats.total_requests += 1
             self.stats.energy_history.append(energy)
+            self.stats.recon_energy_history.append(e_recon)
+            self.stats.predict_energy_history.append(e_predict)
             self.stats.energy_median = self._compute_median()
 
             # Energy → temperature
@@ -154,19 +285,35 @@ class SteeringEngine:
             adjusted = max(self.temp_min, min(self.temp_max, adjusted))
 
             logger.info(
-                "steer_and_generate: energy=%.4f median=%.4f base=%.2f adj=%.3f converged=%s steps=%d",
-                energy, median, base_temp, adjusted, metrics.converged, metrics.steps_used,
+                "steer_and_generate: e_recon=%.4f e_predict=%.4f blended=%.4f "
+                "median=%.4f base=%.2f adj=%.3f converged=%s steps=%d retrieval=%s",
+                e_recon, e_predict, energy, median, base_temp, adjusted,
+                converged, total_steps, retrieval_triggered,
             )
 
             steering = SteeringResult(
                 adjusted_temp=adjusted,
                 energy=energy,
-                converged=metrics.converged,
-                settle_steps=metrics.steps_used,
+                reconstruction_energy=e_recon,
+                predictive_energy=e_predict,
+                converged=converged,
+                settle_steps=total_steps,
                 steering_vector=steering_vector.squeeze(0),
+                retrieval_triggered=retrieval_triggered,
+                retrieval_count=retrieval_count,
+                retrieval_query=retrieval_query,
             )
 
-            # Generate — tokens prefix-match the warm KV cache
+            # --- Update replay buffers ---
+            if len(self._prompt_replay) < self._replay_max:
+                self._prompt_replay.append(embedding.detach().cpu())
+            if self._prev_embedding is not None and len(self._prompt_pair_replay) < self._replay_max:
+                self._prompt_pair_replay.append(
+                    (self._prev_embedding.detach().cpu(), embedding.detach().cpu())
+                )
+            self._prev_embedding = embedding.detach().cpu()
+
+            # Generate — tokens may be original or augmented (retrieval gate)
             result = self.backend.llm.create_completion(
                 prompt=tokens,
                 temperature=adjusted,
@@ -197,19 +344,24 @@ class SteeringEngine:
             self._replay.append(embedding)
 
     def save_checkpoint(self, path: str) -> None:
-        """Save PCHead weights and steering stats to disk."""
+        """Save PCHead weights, steering stats, and replay state to disk."""
         import torch
         data = {
             "pc_head_state_dict": self.pc_head.state_dict(),
             "stats_total_requests": self.stats.total_requests,
             "stats_energy_history": list(self.stats.energy_history),
             "stats_energy_median": self.stats.energy_median,
+            "stats_recon_energy_history": list(self.stats.recon_energy_history),
+            "stats_predict_energy_history": list(self.stats.predict_energy_history),
+            "prev_embedding": self._prev_embedding,
+            "prompt_replay": self._prompt_replay,
+            "prompt_pair_replay": self._prompt_pair_replay,
         }
         torch.save(data, path)
         logger.info("Checkpoint saved to %s (%d requests)", path, self.stats.total_requests)
 
     def load_checkpoint(self, path: str) -> None:
-        """Load PCHead weights and steering stats from disk."""
+        """Load PCHead weights, steering stats, and replay state from disk."""
         import torch
         data = torch.load(path, weights_only=False)
         self.pc_head.load_state_dict(data["pc_head_state_dict"])
@@ -218,21 +370,45 @@ class SteeringEngine:
         history = data.get("stats_energy_history", [])
         self.stats.energy_history = deque(history, maxlen=1000)
         self.stats.energy_median = data.get("stats_energy_median", 0.0)
+        recon_history = data.get("stats_recon_energy_history", [])
+        self.stats.recon_energy_history = deque(recon_history, maxlen=1000)
+        predict_history = data.get("stats_predict_energy_history", [])
+        self.stats.predict_energy_history = deque(predict_history, maxlen=1000)
+        self._prev_embedding = data.get("prev_embedding", None)
+        self._prompt_replay = data.get("prompt_replay", [])
+        self._prompt_pair_replay = data.get("prompt_pair_replay", [])
         logger.info("Checkpoint loaded from %s (%d prior requests)", path, self.stats.total_requests)
 
     def get_stats(self) -> dict:
         return {
             "total_requests": self.stats.total_requests,
             "energy_median": self.stats.energy_median,
+            "recon_energy_median": self._compute_median_from(self.stats.recon_energy_history),
+            "predict_energy_median": self._compute_median_from(self.stats.predict_energy_history),
             "replay_buffer_size": len(self._replay),
+            "prompt_replay_size": len(self._prompt_replay),
+            "pair_replay_size": len(self._prompt_pair_replay),
             "energy_history_len": len(self.stats.energy_history),
+            "retrieval_triggered_total": self.stats.retrieval_triggered_total,
         }
 
     def _compute_median(self) -> float:
-        if not self.stats.energy_history:
+        return self._compute_median_from(self.stats.energy_history)
+
+    @staticmethod
+    def _compute_median_from(history: deque) -> float:
+        if not history:
             return 0.0
-        vals = sorted(self.stats.energy_history)
+        vals = sorted(history)
         n = len(vals)
         if n % 2 == 1:
             return vals[n // 2]
         return (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+
+
+def _extract_last_user_content(messages: list[dict]) -> str | None:
+    """Return content of the last user message, or None."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return msg.get("content")
+    return None

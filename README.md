@@ -6,7 +6,7 @@ Three tiers:
 
 1. **Core PCNetwork** — MLP-shaped predictive coding network benchmarked on MNIST
 2. **GGUF PCHead** — Frozen LLM (via GGUF) as feature extractor + lightweight PC classifier for continual learning
-3. **Chat API Server** — OpenAI-compatible API where PCHead settling energy steers LLM generation temperature
+3. **Chat API Server** — OpenAI-compatible API where PCHead settling dynamics steer LLM generation: two-phase online learning produces reconstruction and predictive energy signals, which drive temperature modulation and autonomous memory retrieval via MemoryGate
 
 ## How It Works
 
@@ -48,7 +48,7 @@ uv sync                        # core deps (torch, torchvision, etc.)
 uv sync --extra gguf           # adds llama-cpp-python
 
 # Optional: Chat API server
-uv sync --extra server         # adds fastapi, uvicorn, sse-starlette
+uv sync --extra server         # adds fastapi, uvicorn, sse-starlette, httpx
 
 # Dev tools
 uv sync --group dev            # adds pytest, pytest-cov
@@ -116,7 +116,8 @@ src/pcdc/
 │
 ├── server/                        # OpenAI-compatible chat API
 │   ├── app.py                     # FastAPI app, routes, CLI entry point
-│   ├── steering.py                # SteeringEngine — energy→temperature mapping
+│   ├── steering.py                # SteeringEngine — two-phase settling, retrieval gate, temperature mapping
+│   ├── memory_client.py           # Sync httpx client for MemoryGate MCP JSON-RPC
 │   └── schemas.py                 # Pydantic models (request/response/SSE)
 │
 ├── training/                      # Training loops and evaluation
@@ -231,24 +232,63 @@ Tasks are presented sequentially. After training on each task, all models are ev
 
 ## Chat API Server
 
-An OpenAI-compatible chat API that uses PCHead settling dynamics to steer LLM generation. Before each completion, the server embeds the prompt, runs PCHead settling, and uses the resulting energy to modulate temperature:
+An OpenAI-compatible chat API where the PCHead acts as the conversation's executive controller. Before each completion, the engine runs two online learning phases that produce distinct energy signals, then uses those signals to both modulate temperature and autonomously retrieve memory context.
+
+### Two-Phase Settling
+
+Each request triggers two `train_step()` calls with a conservative online learning rate (`eta_w=0.0001`, 10x smaller than offline default):
+
+1. **Phase 1 — Reconstruction**: `train_step(embedding, embedding)` → reconstruction energy `E_recon`. Measures how novel this content is (self-reconstruction difficulty).
+2. **Phase 2 — Predictive**: `train_step(prev_embedding, current_embedding)` → predictive energy `E_predict`. Measures how surprising this transition is from the previous turn.
+
+Both phases mix in replay samples (configurable `replay_k`) from prompt embedding buffers to prevent catastrophic forgetting. On the first turn, Phase 2 is skipped and `E_predict = E_recon`.
+
+The blended energy drives temperature:
 
 ```
+energy = β * E_recon + (1-β) * E_predict
 temp = base_temp * (1 + α * tanh((energy - median) / scale))
 ```
 
-High energy (uncertain settling) → higher temperature → more exploratory output. Low energy (confident settling) → lower temperature → more focused output.
+After both training phases, `infer()` runs on the updated weights to produce a steering vector (available for future logit biasing).
+
+### Energy-Triggered Memory Retrieval
+
+When either energy exceeds its threshold, the steering engine autonomously queries MemoryGate for relevant context — the PCHead decides when to retrieve, not the LLM:
+
+```
+if E_recon > threshold or E_predict > threshold:
+    results = memorygate.search(last_user_message)
+    inject results as system context
+    re-embed augmented prompt (refreshes KV cache)
+```
+
+The LLM just sees a longer prompt with relevant context prepended. It doesn't know why the context appeared. This inverts the typical RAG architecture: settling dynamics drive retrieval, the LLM is purely downstream.
+
+**Common case** (below threshold): zero overhead, original warm KV cache used.
+**Retrieval case**: one extra `embed_and_warm` + MemoryGate HTTP call (~2s timeout cap).
+
+The MemoryGate client (`memory_client.py`) calls via MCP JSON-RPC over HTTP. All failures are caught — retrieval never blocks generation.
 
 ### Quick Start
 
 ```bash
 uv sync --extra server
 
-# Start the server
+# Basic — no retrieval
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead.ckpt
+
+# With MemoryGate retrieval
+uv run pcdc-serve \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --pc-checkpoint pchead.ckpt \
+    --mg-url http://localhost:8080/mcp \
+    --mg-recon-threshold 2.5 \
+    --mg-predict-threshold 3.0
 
 # Chat via curl
 curl -X POST http://localhost:8000/v1/chat/completions \
@@ -264,30 +304,55 @@ Any OpenAI-compatible frontend can connect to `http://localhost:8000/v1`.
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completion (streaming + non-streaming) |
 | `/v1/models` | GET | List available models |
-| `/v1/pcdc/stats` | GET | Steering statistics (energy median, request count, replay buffer size) |
-| `/v1/pcdc/checkpoint` | POST | Save PCHead weights + stats to disk |
+| `/v1/pcdc/stats` | GET | Steering statistics (energy medians, replay sizes, retrieval count) |
+| `/v1/pcdc/checkpoint` | POST | Save PCHead weights, stats, and replay buffers to disk |
 | `/v1/pcdc/train` | POST | Online training trigger (placeholder, returns 501) |
 
-Responses include a `pcdc` metadata field with settling energy, convergence status, adjusted temperature, and settle steps. Standard OpenAI clients ignore this field.
+Responses include a `pcdc` metadata field:
+
+```json
+{
+  "settling_energy": 1.234,
+  "reconstruction_energy": 1.45,
+  "predictive_energy": 1.02,
+  "converged": true,
+  "adjusted_temperature": 0.87,
+  "settle_steps": 14,
+  "retrieval_triggered": true,
+  "retrieval_count": 3
+}
+```
+
+Standard OpenAI clients ignore this field.
 
 ### Checkpointing
 
-Pass `--pc-checkpoint path/to/pchead.ckpt` to persist PCHead weights and steering stats across restarts. The checkpoint is loaded on startup (if the file exists) and saved on shutdown. Use `POST /v1/pcdc/checkpoint` for explicit saves.
+Pass `--pc-checkpoint path/to/pchead.ckpt` to persist PCHead weights, steering stats, replay buffers, and previous-turn embedding across restarts. The checkpoint is loaded on startup (if the file exists) and saved on shutdown. Use `POST /v1/pcdc/checkpoint` for explicit saves.
 
 ### Server Options
 
 ```bash
 uv run pcdc-serve \
-    --model MODEL_PATH          # Required: path to GGUF model
-    --host 0.0.0.0              # Bind address (default: 0.0.0.0)
-    --port 8000                 # Port (default: 8000)
-    --n-ctx 4096                # Context window size
-    --n-threads 8               # CPU threads
-    --n-gpu-layers 0            # GPU offload layers (0 = CPU only)
-    --pc-alpha 0.5              # Energy-temperature coupling strength
-    --pc-energy-scale 1.0       # Energy normalization scale
-    --pc-checkpoint PATH        # Save/load PCHead state
-    --log-level INFO            # Log level
+    --model MODEL_PATH              # Required: path to GGUF model
+    --host 0.0.0.0                  # Bind address (default: 0.0.0.0)
+    --port 8000                     # Port (default: 8000)
+    --n-ctx 4096                    # Context window size
+    --n-threads 8                   # CPU threads
+    --n-gpu-layers 0                # GPU offload layers (0 = CPU only)
+    --pc-alpha 0.5                  # Energy-temperature coupling strength
+    --pc-energy-scale 1.0           # Energy normalization scale
+    --pc-checkpoint PATH            # Save/load PCHead state + replay buffers
+    --pc-beta 0.5                   # Blend ratio: energy = β*E_recon + (1-β)*E_predict
+    --pc-online-eta-w 0.0001        # Online learning rate (default: 0.0001)
+    --pc-replay-k 4                 # Replay samples per training phase
+    --mg-url URL                    # MemoryGate MCP endpoint (enables retrieval)
+    --mg-timeout 2.0                # MemoryGate request timeout in seconds
+    --mg-bearer-token TOKEN         # Bearer token for MemoryGate auth
+    --mg-recon-threshold INF        # Reconstruction energy retrieval threshold
+    --mg-predict-threshold INF      # Predictive energy retrieval threshold
+    --mg-retrieval-limit 3          # Max memory items to retrieve
+    --mg-retrieval-min-confidence 0.5  # Min confidence for retrieved memories
+    --log-level INFO                # Log level
 ```
 
 ## Configuration Reference
@@ -384,12 +449,21 @@ uv run pcdc-continual \
     --seed 42 \
     --output-dir ./experiments
 
-# Chat API server
+# Chat API server (basic)
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead.ckpt \
     --port 8000
+
+# Chat API server (with MemoryGate retrieval)
+uv run pcdc-serve \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --pc-checkpoint pchead.ckpt \
+    --mg-url http://localhost:8080/mcp \
+    --mg-recon-threshold 2.5 \
+    --mg-predict-threshold 3.0
 ```
 
 ## Status
@@ -402,11 +476,14 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Oscillation detection + adaptive damping stabilize settling
 - Continual learning pipeline with replay and forgetting metrics
 - Weight alignment diagnostic confirms PC ≈ backprop for linear case
-- Chat API server with energy-based temperature steering
-- PCHead checkpoint save/load across server restarts
+- Two-phase online learning (reconstruction + predictive) during generation
+- Dual energy signals: content novelty (E_recon) and conversation dynamics (E_predict)
+- Energy-triggered autonomous memory retrieval via MemoryGate
+- Replay buffer mixing in both training phases to prevent catastrophic forgetting
+- PCHead checkpoint save/load with full replay state across server restarts
 
 **What's next:**
-- PCHead training on conversation embeddings (needs quality signal design)
+- Median-relative retrieval thresholds (adaptive instead of absolute)
 - v2 steering: project steering vector → logit bias via LLM embedding matrix
 - Run MNIST to convergence and tune hyperparameters for >90% accuracy
 - End-to-end GGUF continual learning with a real model

@@ -44,6 +44,17 @@ class ServerConfig:
     pc_alpha: float = 0.5
     pc_energy_scale: float = 1.0
     pc_checkpoint: str | None = None
+    pc_beta: float = 0.5
+    pc_online_eta_w: float = 0.0001
+    pc_replay_k: int = 4
+    # MemoryGate retrieval
+    mg_url: str | None = None
+    mg_timeout: float = 2.0
+    mg_bearer_token: str | None = None
+    mg_recon_threshold: float = float("inf")
+    mg_predict_threshold: float = float("inf")
+    mg_retrieval_limit: int = 3
+    mg_retrieval_min_confidence: float = 0.5
 
 
 # Llama-3 chat template
@@ -62,6 +73,25 @@ def format_llama3_prompt(messages: list[ChatMessage]) -> str:
     # Add assistant header to prime generation
     parts.append(LLAMA3_HEADER.format(role="assistant"))
     return "".join(parts)
+
+
+def format_augmented_prompt(messages: list[dict], memory_results: list) -> str:
+    """Rebuild Llama-3 prompt with retrieved memory context injected.
+
+    Inserts a system message at position 0 containing the retrieved
+    memory items, then re-formats the full message list.
+    """
+    context_lines = []
+    for i, r in enumerate(memory_results, 1):
+        context_lines.append(f"[{i}] ({r.source_type}, conf={r.confidence:.2f}) {r.text}")
+    context_block = "\n".join(context_lines)
+
+    context_msg = ChatMessage(
+        role="system",
+        content=f"Relevant context from memory:\n{context_block}",
+    )
+    original_msgs = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]
+    return format_llama3_prompt([context_msg] + original_msgs)
 
 
 def create_app(config: ServerConfig) -> FastAPI:
@@ -97,11 +127,31 @@ def create_app(config: ServerConfig) -> FastAPI:
         pc_head.eval()
         logger.info("PCHead initialized: [%d, %s, %d]", hidden_dim, hidden_sizes, hidden_dim)
 
+        # Memory client (optional — only created when --mg-url is set)
+        memory_client = None
+        if config.mg_url:
+            from pcdc.server.memory_client import MemoryClient
+            memory_client = MemoryClient(
+                base_url=config.mg_url,
+                timeout=config.mg_timeout,
+                bearer_token=config.mg_bearer_token,
+            )
+            logger.info("MemoryGate client initialized: %s", config.mg_url)
+
         engine = SteeringEngine(
             backend=backend,
             pc_head=pc_head,
             alpha=config.pc_alpha,
             energy_scale=config.pc_energy_scale,
+            beta=config.pc_beta,
+            online_eta_w=config.pc_online_eta_w,
+            replay_k=config.pc_replay_k,
+            memory_client=memory_client,
+            retrieval_recon_threshold=config.mg_recon_threshold,
+            retrieval_predict_threshold=config.mg_predict_threshold,
+            retrieval_limit=config.mg_retrieval_limit,
+            retrieval_min_confidence=config.mg_retrieval_min_confidence,
+            format_prompt_fn=format_augmented_prompt if memory_client else None,
         )
 
         # Load checkpoint if provided
@@ -128,9 +178,11 @@ def create_app(config: ServerConfig) -> FastAPI:
         logger.info("PCDC server ready on %s:%d", config.host, config.port)
         yield
 
-        # --- Shutdown: save checkpoint ---
+        # --- Shutdown: save checkpoint, close clients ---
         if config.pc_checkpoint:
             engine.save_checkpoint(config.pc_checkpoint)
+        if memory_client:
+            memory_client.close()
         logger.info("Shutting down PCDC server")
 
     app = FastAPI(title="PCDC Chat API", lifespan=lifespan)
@@ -166,18 +218,23 @@ def create_app(config: ServerConfig) -> FastAPI:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
         if request.stream:
+            messages_raw = [{"role": m.role, "content": m.content} for m in request.messages]
             return EventSourceResponse(
                 _stream_completion(
-                    engine, prompt, completion_id, request, stop,
+                    engine, prompt, completion_id, request, stop, messages_raw,
                 ),
                 media_type="text/event-stream",
             )
         else:
-            # Single atomic call: embed → steer → generate (KV cache reused)
+            # Raw messages for potential retrieval-triggered prompt rebuild
+            messages_raw = [{"role": m.role, "content": m.content} for m in request.messages]
+
+            # Single atomic call: embed → steer → retrieval gate → generate
             steering, result = await asyncio.to_thread(
                 engine.steer_and_generate,
                 prompt,
                 request.temperature,
+                messages=messages_raw,
                 top_p=request.top_p,
                 max_tokens=request.max_tokens,
                 stop=stop or [],
@@ -185,9 +242,13 @@ def create_app(config: ServerConfig) -> FastAPI:
 
             pcdc_meta = PCDCMetadata(
                 settling_energy=steering.energy,
+                reconstruction_energy=steering.reconstruction_energy,
+                predictive_energy=steering.predictive_energy,
                 converged=steering.converged,
                 adjusted_temperature=steering.adjusted_temp,
                 settle_steps=steering.settle_steps,
+                retrieval_triggered=steering.retrieval_triggered,
+                retrieval_count=steering.retrieval_count,
             )
 
             content = result["choices"][0]["text"]
@@ -220,14 +281,16 @@ def create_app(config: ServerConfig) -> FastAPI:
         completion_id: str,
         request: ChatCompletionRequest,
         stop: list[str] | None,
+        messages_raw: list[dict] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Yield SSE events in OpenAI streaming format."""
 
-        # Single atomic call: embed → steer → generate (KV cache reused)
+        # Single atomic call: embed → steer → retrieval gate → generate
         def _start():
             return engine.steer_and_generate(
                 prompt,
                 request.temperature,
+                messages=messages_raw,
                 top_p=request.top_p,
                 max_tokens=request.max_tokens,
                 stop=stop or [],
@@ -238,9 +301,13 @@ def create_app(config: ServerConfig) -> FastAPI:
 
         pcdc_meta = PCDCMetadata(
             settling_energy=steering.energy,
+            reconstruction_energy=steering.reconstruction_energy,
+            predictive_energy=steering.predictive_energy,
             converged=steering.converged,
             adjusted_temperature=steering.adjusted_temp,
             settle_steps=steering.settle_steps,
+            retrieval_triggered=steering.retrieval_triggered,
+            retrieval_count=steering.retrieval_count,
         )
 
         # First chunk: role + pcdc metadata
@@ -333,6 +400,17 @@ def main():
     parser.add_argument("--pc-alpha", type=float, default=0.5, help="Energy-temperature coupling strength")
     parser.add_argument("--pc-energy-scale", type=float, default=1.0, help="Energy normalization scale")
     parser.add_argument("--pc-checkpoint", default=None, help="Path to save/load PCHead checkpoint (auto-saves on shutdown)")
+    parser.add_argument("--pc-beta", type=float, default=0.5, help="Blend ratio: energy = beta*E_recon + (1-beta)*E_predict (default: 0.5)")
+    parser.add_argument("--pc-online-eta-w", type=float, default=0.0001, help="Online learning rate for train_step phases (default: 0.0001)")
+    parser.add_argument("--pc-replay-k", type=int, default=4, help="Replay samples per training phase (default: 4)")
+    # MemoryGate retrieval
+    parser.add_argument("--mg-url", default=None, help="MemoryGate MCP endpoint URL (enables retrieval)")
+    parser.add_argument("--mg-timeout", type=float, default=2.0, help="MemoryGate request timeout in seconds (default: 2.0)")
+    parser.add_argument("--mg-bearer-token", default=None, help="Bearer token for MemoryGate auth")
+    parser.add_argument("--mg-recon-threshold", type=float, default=float("inf"), help="Reconstruction energy threshold for retrieval (default: disabled)")
+    parser.add_argument("--mg-predict-threshold", type=float, default=float("inf"), help="Predictive energy threshold for retrieval (default: disabled)")
+    parser.add_argument("--mg-retrieval-limit", type=int, default=3, help="Max memory items to retrieve (default: 3)")
+    parser.add_argument("--mg-retrieval-min-confidence", type=float, default=0.5, help="Min confidence for retrieved memories (default: 0.5)")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
     args = parser.parse_args()
 
@@ -351,6 +429,16 @@ def main():
         pc_alpha=args.pc_alpha,
         pc_energy_scale=args.pc_energy_scale,
         pc_checkpoint=args.pc_checkpoint,
+        pc_beta=args.pc_beta,
+        pc_online_eta_w=args.pc_online_eta_w,
+        pc_replay_k=args.pc_replay_k,
+        mg_url=args.mg_url,
+        mg_timeout=args.mg_timeout,
+        mg_bearer_token=args.mg_bearer_token,
+        mg_recon_threshold=args.mg_recon_threshold,
+        mg_predict_threshold=args.mg_predict_threshold,
+        mg_retrieval_limit=args.mg_retrieval_limit,
+        mg_retrieval_min_confidence=args.mg_retrieval_min_confidence,
     )
 
     import uvicorn
