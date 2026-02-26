@@ -17,6 +17,12 @@ dependencies = [
 gguf = [
     "llama-cpp-python>=0.2.50",
 ]
+server = [
+    "llama-cpp-python>=0.2.50",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "sse-starlette>=1.8.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -29,6 +35,7 @@ packages = ["src/pcdc"]
 pcdc-mnist = "pcdc.training.train_mnist_pc:main"
 pcdc-continual = "pcdc.training.continual_runner:main"
 pcdc-depth-time = "pcdc.training.depth_time_experiment:main_cli"
+pcdc-serve = "pcdc.server.app:main"
 
 [dependency-groups]
 dev = [

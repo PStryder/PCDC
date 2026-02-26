@@ -42,6 +42,20 @@ class GGUFBackend:
         self.hidden_dim = self.llm.n_embd()
         self._n_layers = self.llm.n_layer() if hasattr(self.llm, 'n_layer') else None
 
+    def embed_chat(self, text: str) -> Tensor:
+        """Embed a single text and return a (hidden_dim,) tensor.
+
+        Convenience wrapper for chat serving — avoids the batch dimension
+        and progress-bar overhead of extract_features.  Mean-pools across
+        tokens when the backend returns per-token embeddings.
+        """
+        emb = self.llm.embed(text)
+        t = torch.tensor(emb, dtype=torch.float32)
+        if t.dim() == 2:
+            # Per-token embeddings (n_tokens, hidden_dim) → mean pool
+            t = t.mean(dim=0)
+        return t
+
     def extract_features(
         self,
         texts: list[str],
