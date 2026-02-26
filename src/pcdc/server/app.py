@@ -155,19 +155,8 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest):
         engine = state["engine"]
-        backend = state["backend"]
 
         prompt = format_llama3_prompt(request.messages)
-
-        # Steer: embed + PCHead settle → adjusted temperature
-        steering = await asyncio.to_thread(engine.steer, prompt, request.temperature)
-
-        pcdc_meta = PCDCMetadata(
-            settling_energy=steering.energy,
-            converged=steering.converged,
-            adjusted_temperature=steering.adjusted_temp,
-            settle_steps=steering.settle_steps,
-        )
 
         # Prepare stop sequences
         stop = request.stop
@@ -179,23 +168,29 @@ def create_app(config: ServerConfig) -> FastAPI:
         if request.stream:
             return EventSourceResponse(
                 _stream_completion(
-                    backend, prompt, steering, pcdc_meta,
-                    completion_id, request, stop,
+                    engine, prompt, completion_id, request, stop,
                 ),
                 media_type="text/event-stream",
             )
         else:
-            # Non-streaming
-            result = await asyncio.to_thread(
-                backend.llm.create_chat_completion,
-                messages=[{"role": m.role, "content": m.content} for m in request.messages],
-                temperature=steering.adjusted_temp,
+            # Single atomic call: embed → steer → generate (KV cache reused)
+            steering, result = await asyncio.to_thread(
+                engine.steer_and_generate,
+                prompt,
+                request.temperature,
                 top_p=request.top_p,
                 max_tokens=request.max_tokens,
                 stop=stop or [],
             )
 
-            content = result["choices"][0]["message"]["content"]
+            pcdc_meta = PCDCMetadata(
+                settling_energy=steering.energy,
+                converged=steering.converged,
+                adjusted_temperature=steering.adjusted_temp,
+                settle_steps=steering.settle_steps,
+            )
+
+            content = result["choices"][0]["text"]
             usage = result.get("usage", {})
 
             # Background: buffer for replay
@@ -220,17 +215,35 @@ def create_app(config: ServerConfig) -> FastAPI:
             )
 
     async def _stream_completion(
-        backend,
+        engine,
         prompt: str,
-        steering,
-        pcdc_meta: PCDCMetadata,
         completion_id: str,
         request: ChatCompletionRequest,
         stop: list[str] | None,
     ) -> AsyncGenerator[str, None]:
         """Yield SSE events in OpenAI streaming format."""
 
-        # First chunk: role
+        # Single atomic call: embed → steer → generate (KV cache reused)
+        def _start():
+            return engine.steer_and_generate(
+                prompt,
+                request.temperature,
+                top_p=request.top_p,
+                max_tokens=request.max_tokens,
+                stop=stop or [],
+                stream=True,
+            )
+
+        steering, stream = await asyncio.to_thread(_start)
+
+        pcdc_meta = PCDCMetadata(
+            settling_energy=steering.energy,
+            converged=steering.converged,
+            adjusted_temperature=steering.adjusted_temp,
+            settle_steps=steering.settle_steps,
+        )
+
+        # First chunk: role + pcdc metadata
         first_chunk = ChatCompletionChunk(
             id=completion_id,
             choices=[
@@ -242,23 +255,10 @@ def create_app(config: ServerConfig) -> FastAPI:
         )
         yield json.dumps(first_chunk.model_dump(), ensure_ascii=False)
 
-        # Stream tokens
-        def _generate():
-            return backend.llm.create_chat_completion(
-                messages=[{"role": m.role, "content": m.content} for m in request.messages],
-                temperature=steering.adjusted_temp,
-                top_p=request.top_p,
-                max_tokens=request.max_tokens,
-                stop=stop or [],
-                stream=True,
-            )
-
-        stream = await asyncio.to_thread(_generate)
-
+        # Stream tokens (iterator holds the steering lock until exhausted)
         collected_text = []
         for chunk_data in stream:
-            delta = chunk_data["choices"][0].get("delta", {})
-            content = delta.get("content")
+            content = chunk_data["choices"][0].get("text")
             finish_reason = chunk_data["choices"][0].get("finish_reason")
 
             if content:
@@ -290,7 +290,6 @@ def create_app(config: ServerConfig) -> FastAPI:
         # Background: buffer for replay
         full_text = "".join(collected_text)
         if full_text:
-            engine = state["engine"]
             asyncio.get_event_loop().call_soon(
                 lambda: asyncio.ensure_future(asyncio.to_thread(engine.record, full_text))
             )

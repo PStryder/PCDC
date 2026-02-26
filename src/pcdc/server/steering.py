@@ -7,6 +7,7 @@ import math
 import threading
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any, Generator
 
 import torch
 from torch import Tensor
@@ -100,6 +101,93 @@ class SteeringEngine:
             settle_steps=metrics.steps_used,
             steering_vector=steering_vector.squeeze(0),
         )
+
+    def steer_and_generate(
+        self,
+        prompt_text: str,
+        base_temp: float = 1.0,
+        **completion_kwargs: Any,
+    ) -> tuple[SteeringResult, Any]:
+        """Atomic embed → steer → generate with KV-cache reuse.
+
+        Holds ``self._lock`` for the entire sequence so the warm KV cache
+        from ``embed_and_warm`` is still intact when ``create_completion``
+        runs, giving it a prefix hit that skips prompt re-processing.
+
+        For streaming (``stream=True`` in *completion_kwargs*), the returned
+        iterator wrapper keeps the lock held until the stream is exhausted.
+
+        Args:
+            prompt_text: Fully-formatted prompt (Llama-3 template already
+                applied).
+            base_temp: Base temperature before energy modulation.
+            **completion_kwargs: Forwarded to
+                ``backend.llm.create_completion()`` — include ``top_p``,
+                ``max_tokens``, ``stop``, ``stream``, etc.
+
+        Returns:
+            ``(SteeringResult, completion_result_or_stream)``
+        """
+        is_stream = completion_kwargs.get("stream", False)
+        self._lock.acquire()
+        released = False
+        try:
+            embedding, tokens = self.backend.embed_and_warm(prompt_text)
+
+            # PCHead expects (B, feature_dim)
+            x_input = embedding.unsqueeze(0).to(next(self.pc_head.parameters()).device)
+
+            with torch.no_grad():
+                steering_vector, metrics = self.pc_head.infer(x_input)
+
+            energy = metrics.final_energy
+
+            # Update running stats
+            self.stats.total_requests += 1
+            self.stats.energy_history.append(energy)
+            self.stats.energy_median = self._compute_median()
+
+            # Energy → temperature
+            median = self.stats.energy_median
+            scale = self.energy_scale if self.energy_scale > 0 else 1.0
+            adjusted = base_temp * (1.0 + self.alpha * math.tanh((energy - median) / scale))
+            adjusted = max(self.temp_min, min(self.temp_max, adjusted))
+
+            logger.info(
+                "steer_and_generate: energy=%.4f median=%.4f base=%.2f adj=%.3f converged=%s steps=%d",
+                energy, median, base_temp, adjusted, metrics.converged, metrics.steps_used,
+            )
+
+            steering = SteeringResult(
+                adjusted_temp=adjusted,
+                energy=energy,
+                converged=metrics.converged,
+                settle_steps=metrics.steps_used,
+                steering_vector=steering_vector.squeeze(0),
+            )
+
+            # Generate — tokens prefix-match the warm KV cache
+            result = self.backend.llm.create_completion(
+                prompt=tokens,
+                temperature=adjusted,
+                **completion_kwargs,
+            )
+
+            if is_stream:
+                released = True
+                return steering, self._locked_iter(result)
+            else:
+                return steering, result
+        finally:
+            if not released:
+                self._lock.release()
+
+    def _locked_iter(self, it: Any) -> Generator:
+        """Wrap an iterator so ``self._lock`` is released when exhausted."""
+        try:
+            yield from it
+        finally:
+            self._lock.release()
 
     def record(self, text: str) -> None:
         """Buffer an embedding in the replay buffer for future training."""

@@ -42,6 +42,31 @@ class GGUFBackend:
         self.hidden_dim = self.llm.n_embd()
         self._n_layers = self.llm.n_layer() if hasattr(self.llm, 'n_layer') else None
 
+    def embed_and_warm(self, text: str) -> tuple[Tensor, list[int]]:
+        """Embed text and leave KV cache warm for generation prefix reuse.
+
+        Tokenizes and evals the prompt, extracts the last-token embedding,
+        and leaves the KV cache populated so a subsequent
+        ``create_completion(prompt=tokens)`` gets a prefix hit and skips
+        prompt re-processing.
+
+        Returns:
+            (embedding, tokens) — embedding is ``(hidden_dim,)``; tokens
+            can be passed directly to ``create_completion()`` for cache reuse.
+        """
+        tokens = self.llm.tokenize(text.encode("utf-8"), special=True)
+
+        self.llm.reset()
+        self.llm.eval(tokens)
+
+        # After eval with default logits_all=False, only the last token has
+        # its embedding stored.  Index -1 → last output position.
+        n_embd = self.llm.n_embd()
+        emb_ptr = self.llm._ctx.get_embeddings_ith(-1)
+        emb = [emb_ptr[i] for i in range(n_embd)]
+
+        return torch.tensor(emb, dtype=torch.float32), tokens
+
     def embed_chat(self, text: str) -> Tensor:
         """Embed a single text and return a (hidden_dim,) tensor.
 
