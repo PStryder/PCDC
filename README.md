@@ -118,10 +118,8 @@ src/pcdc/
 │   ├── app.py                     # FastAPI app, routes, CLI entry point
 │   ├── steering.py                # SteeringEngine — two-phase settling, retrieval gate, temperature mapping
 │   ├── memory_client.py           # Sync httpx client for MemoryGate MCP JSON-RPC
+│   ├── telemetry_db.py            # SQLite per-turn telemetry recorder (WAL mode)
 │   └── schemas.py                 # Pydantic models (request/response/SSE)
-│
-├── scripts/
-│   └── plot_session.py            # Plot energy histories + cosine distances from server stats
 │
 ├── data/
 │   └── bootstrap_corpus.txt       # Diverse text corpus for PCHead pre-training
@@ -129,6 +127,8 @@ src/pcdc/
 scripts/                               # Standalone experiment and utility scripts
 ├── pretrain_pchead.py                 # Offline PCHead pre-training for attractor basins
 ├── ghost_mic.py                       # Deviation vector analysis experiments
+├── gather_telemetry.py                # On-corpus telemetry collection (20 prompts, 8 domains)
+├── gather_telemetry_offcorpus.py      # Off-corpus generalization test (20 prompts, novel domains)
 └── plot_session.py                    # Session energy visualization
 │
 ├── training/                      # Training loops and evaluation
@@ -262,6 +262,8 @@ energy = β * E_recon + (1-β) * E_predict
 temp = base_temp * (1 + α * tanh((energy - median) / scale))
 ```
 
+By default, `scale` is adaptive (IQR-based): computed from the interquartile range of the blended energy history so that `±1 IQR` from median maps to `tanh(±1) ≈ ±0.76`. This gives smooth temperature gradation across the full `[base*(1-α), base*(1+α)]` range regardless of the model's energy regime. A fixed scale can be set with `--pc-energy-scale`.
+
 After both training phases, `infer()` runs on the updated weights to produce a steering vector and a deviation vector (`settled - original`), which is used by deviation routing (see below).
 
 **Tuning insight:** At `eta_w=1e-4`, energy declines monotonically (~17% over 8 turns) regardless of topic shifts — the network adapts faster than novelty can register. At `eta_w=1e-5`, decline is only ~2.5% over 12 turns, energy responds to domain shifts, and temperature actually varies (0.35–1.05 vs stuck at 0.35). See `docs/session2_energy_plot.png` for the comparison.
@@ -325,7 +327,7 @@ uv run pcdc-serve \
     --n-gpu-layers 33 \
     --pc-checkpoint pchead_pretrained.ckpt
 
-# Full stack: pre-trained checkpoint + deviation routing + MemoryGate
+# Full stack: pre-trained checkpoint + deviation routing + telemetry + MemoryGate
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
@@ -334,6 +336,7 @@ uv run pcdc-serve \
     --pc-settle-k 100 \
     --pc-deviation-routing \
     --pc-deviation-threshold 0.4 \
+    --telemetry-db pcdc_telemetry.db \
     --mg-url http://localhost:8080/mcp \
     --mg-predict-percentile 95
 
@@ -389,7 +392,7 @@ uv run pcdc-serve \
     --n-threads 8                   # CPU threads
     --n-gpu-layers 0                # GPU offload layers (0 = CPU only)
     --pc-alpha 0.5                  # Energy-temperature coupling strength
-    --pc-energy-scale 1.0           # Energy normalization scale
+    --pc-energy-scale 0.0           # Energy normalization (0 = adaptive IQR, default)
     --pc-checkpoint PATH            # Save/load PCHead state + replay buffers
     --pc-beta 0.5                   # Blend ratio: energy = β*E_recon + (1-β)*E_predict
     --pc-online-eta-w 0.00001       # Online learning rate (recommended: 1e-5)
@@ -405,6 +408,7 @@ uv run pcdc-serve \
     --mg-retrieval-min-confidence 0.5  # Min confidence for retrieved memories
     --pc-deviation-routing          # Enable deviation-based retrieval routing
     --pc-deviation-threshold 0.6    # Cosine similarity threshold for deviation routing
+    --telemetry-db PATH             # SQLite DB for per-turn telemetry (deviation vectors, energies, match scores)
     --log-level INFO                # Log level
 ```
 
@@ -537,6 +541,7 @@ uv run pcdc-serve \
     --pc-settle-k 100 \
     --pc-deviation-routing \
     --pc-deviation-threshold 0.4 \
+    --telemetry-db pcdc_telemetry.db \
     --mg-url http://localhost:8080/mcp \
     --mg-predict-percentile 95
 ```
@@ -564,6 +569,9 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Pre-trained deviations show semantic domain matching (Rust prompt matches Rust paragraph at cos=0.654, philosophy matches philosophy at cos=0.608)
 - Ghost Mic experiment validates deviation routing end-to-end (`scripts/ghost_mic.py`)
 - Dual replay buffers (embeddings + deviations) persist through checkpoints and survive server restarts
+- Adaptive IQR temperature scale — auto-calibrates to the model's energy distribution, replaces fixed scale that caused saturation (18 unique temps vs 3)
+- SQLite telemetry database records per-turn deviation vectors, energies, match scores, and temperature (`--telemetry-db`)
+- **Off-corpus generalization confirmed**: pre-trained deviation matches generalize to novel domains not in the bootstrap corpus (avg 0.728 off-corpus vs 0.731 on-corpus vs ~0.07 untrained baseline). Tested on sports, law, music, agriculture, film, psychology, linguistics, and truly alien domains (dog grooming, cricket, knitting)
 
 **What's next:**
 - Store text alongside deviation replay entries so deviation-matched text can be used as retrieval query directly (currently the user's prompt is used)
@@ -576,3 +584,5 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 ## Documentation
 
 - [System Architecture](docs/system_architecture.md) — detailed explanation of how all components work together
+- [Session 3 — Pre-Trained PCHead + Deviation Routing](docs/session_transcript_2026-02-27_session3.md) — first live session with pre-trained checkpoint, deviation routing, and adaptive IQR temperature fix
+- [Session 4 — Off-Corpus Generalization](docs/session_transcript_2026-02-27_session4.md) — test of deviation matching on 17 domains not in the bootstrap corpus
