@@ -37,6 +37,7 @@ class PCDCMetadata(BaseModel):
     cosine_distance: float | None = None  # embedding distance to previous turn
     retrieval_triggered: bool = False
     retrieval_count: int = 0
+    deviation_match_score: float | None = None
 
 
 # --- Non-streaming response ---

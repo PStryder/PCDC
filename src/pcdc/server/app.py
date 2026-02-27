@@ -57,6 +57,9 @@ class ServerConfig:
     mg_predict_percentile: float | None = None
     mg_retrieval_limit: int = 3
     mg_retrieval_min_confidence: float = 0.5
+    # Deviation routing
+    pc_deviation_routing: bool = False
+    pc_deviation_threshold: float = 0.6
 
 
 # Llama-3 chat template
@@ -156,6 +159,8 @@ def create_app(config: ServerConfig) -> FastAPI:
             retrieval_limit=config.mg_retrieval_limit,
             retrieval_min_confidence=config.mg_retrieval_min_confidence,
             format_prompt_fn=format_augmented_prompt if memory_client else None,
+            deviation_routing_enabled=config.pc_deviation_routing,
+            deviation_routing_threshold=config.pc_deviation_threshold,
         )
 
         # Load checkpoint if provided
@@ -254,6 +259,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 cosine_distance=steering.cosine_distance,
                 retrieval_triggered=steering.retrieval_triggered,
                 retrieval_count=steering.retrieval_count,
+                deviation_match_score=steering.deviation_match_score,
             )
 
             content = result["choices"][0]["text"]
@@ -311,8 +317,10 @@ def create_app(config: ServerConfig) -> FastAPI:
             converged=steering.converged,
             adjusted_temperature=steering.adjusted_temp,
             settle_steps=steering.settle_steps,
+            cosine_distance=steering.cosine_distance,
             retrieval_triggered=steering.retrieval_triggered,
             retrieval_count=steering.retrieval_count,
+            deviation_match_score=steering.deviation_match_score,
         )
 
         # First chunk: role + pcdc metadata
@@ -418,6 +426,9 @@ def main():
     parser.add_argument("--mg-predict-percentile", type=float, default=None, help="Dynamic retrieval threshold as percentile of predict energy history (e.g., 95)")
     parser.add_argument("--mg-retrieval-limit", type=int, default=3, help="Max memory items to retrieve (default: 3)")
     parser.add_argument("--mg-retrieval-min-confidence", type=float, default=0.5, help="Min confidence for retrieved memories (default: 0.5)")
+    # Deviation routing
+    parser.add_argument("--pc-deviation-routing", action="store_true", default=False, help="Enable deviation-based retrieval routing")
+    parser.add_argument("--pc-deviation-threshold", type=float, default=0.6, help="Cosine similarity threshold for deviation routing (default: 0.6)")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
     args = parser.parse_args()
 
@@ -448,6 +459,8 @@ def main():
         mg_predict_percentile=args.mg_predict_percentile,
         mg_retrieval_limit=args.mg_retrieval_limit,
         mg_retrieval_min_confidence=args.mg_retrieval_min_confidence,
+        pc_deviation_routing=args.pc_deviation_routing,
+        pc_deviation_threshold=args.pc_deviation_threshold,
     )
 
     import uvicorn

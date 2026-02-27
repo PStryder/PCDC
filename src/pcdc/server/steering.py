@@ -32,6 +32,8 @@ class SteeringResult:
     retrieval_triggered: bool = False
     retrieval_count: int = 0
     retrieval_query: str | None = None
+    deviation_match_score: float | None = None  # best cosine sim to replay buffer
+    deviation_match_idx: int | None = None      # index in replay buffer
 
 
 @dataclass
@@ -43,6 +45,8 @@ class SteeringStats:
     predict_energy_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     cosine_distance_history: deque = field(default_factory=lambda: deque(maxlen=1000))
     retrieval_triggered_total: int = 0
+    deviation_routing_total: int = 0
+    deviation_match_history: deque = field(default_factory=lambda: deque(maxlen=1000))
 
 
 class SteeringEngine:
@@ -73,6 +77,9 @@ class SteeringEngine:
         retrieval_limit: int = 3,
         retrieval_min_confidence: float = 0.5,
         format_prompt_fn: Callable | None = None,
+        # Deviation routing
+        deviation_routing_enabled: bool = False,
+        deviation_routing_threshold: float = 0.6,
     ):
         self.backend = backend
         self.pc_head = pc_head
@@ -93,6 +100,10 @@ class SteeringEngine:
         self._retrieval_limit = retrieval_limit
         self._retrieval_min_confidence = retrieval_min_confidence
         self._format_prompt_fn = format_prompt_fn
+
+        # Deviation routing
+        self._deviation_routing_enabled = deviation_routing_enabled
+        self._deviation_routing_threshold = deviation_routing_threshold
 
         self._lock = threading.Lock()
         self.stats = SteeringStats()
@@ -302,6 +313,60 @@ class SteeringEngine:
             with torch.no_grad():
                 steering_vector, infer_metrics = self.pc_head.infer(x_input)
 
+            # --- Deviation routing ---
+            deviation_match_score = None
+            deviation_match_idx = None
+
+            if (
+                self._deviation_routing_enabled
+                and len(self._prompt_replay) >= 10
+            ):
+                with torch.no_grad():
+                    deviation = steering_vector.squeeze(0) - embedding.to(device)
+                    dev_norm = deviation.norm()
+                    if dev_norm > 1e-8:
+                        dev_unit = deviation / dev_norm
+                        # Batch cosine similarity against replay buffer (all on CPU to avoid VRAM)
+                        replay_stack = torch.stack(self._prompt_replay)  # (N, D) — already CPU
+                        dev_cpu = dev_unit.detach().cpu()
+                        cos_scores = torch.nn.functional.cosine_similarity(
+                            dev_cpu.unsqueeze(0), replay_stack,
+                        )  # (N,)
+                        best_score_t, best_idx_t = cos_scores.max(dim=0)
+                        deviation_match_score = best_score_t.item()
+                        deviation_match_idx = best_idx_t.item()
+
+                        self.stats.deviation_match_history.append(deviation_match_score)
+
+                        # Gate retrieval on deviation match
+                        if (
+                            deviation_match_score > self._deviation_routing_threshold
+                            and self._memory_client is not None
+                            and self._format_prompt_fn is not None
+                            and messages is not None
+                            and not retrieval_triggered  # don't double-trigger
+                        ):
+                            retrieval_query = _extract_last_user_content(messages)
+                            if retrieval_query:
+                                results = self._memory_client.search(
+                                    query=retrieval_query,
+                                    limit=self._retrieval_limit,
+                                    min_confidence=self._retrieval_min_confidence,
+                                )
+                                if results:
+                                    retrieval_triggered = True
+                                    retrieval_count = len(results)
+                                    self.stats.retrieval_triggered_total += 1
+                                    self.stats.deviation_routing_total += 1
+                                    augmented_prompt = self._format_prompt_fn(messages, results)
+                                    _, tokens = self.backend.embed_and_warm(augmented_prompt)
+                                    logger.info(
+                                        "deviation_routing: triggered (score=%.4f idx=%d), "
+                                        "injected %d memory items",
+                                        deviation_match_score, deviation_match_idx,
+                                        retrieval_count,
+                                    )
+
             # Update running stats
             self.stats.total_requests += 1
             self.stats.energy_history.append(energy)
@@ -339,6 +404,8 @@ class SteeringEngine:
                 retrieval_triggered=retrieval_triggered,
                 retrieval_count=retrieval_count,
                 retrieval_query=retrieval_query,
+                deviation_match_score=deviation_match_score,
+                deviation_match_idx=deviation_match_idx,
             )
 
             # --- Update replay buffers ---
@@ -394,6 +461,8 @@ class SteeringEngine:
             "prev_embedding": self._prev_embedding,
             "prompt_replay": self._prompt_replay,
             "prompt_pair_replay": self._prompt_pair_replay,
+            "stats_deviation_routing_total": self.stats.deviation_routing_total,
+            "stats_deviation_match_history": list(self.stats.deviation_match_history),
         }
         torch.save(data, path)
         logger.info("Checkpoint saved to %s (%d requests)", path, self.stats.total_requests)
@@ -417,6 +486,9 @@ class SteeringEngine:
         self._prev_embedding = data.get("prev_embedding", None)
         self._prompt_replay = data.get("prompt_replay", [])
         self._prompt_pair_replay = data.get("prompt_pair_replay", [])
+        self.stats.deviation_routing_total = data.get("stats_deviation_routing_total", 0)
+        dev_match_history = data.get("stats_deviation_match_history", [])
+        self.stats.deviation_match_history = deque(dev_match_history, maxlen=1000)
         logger.info("Checkpoint loaded from %s (%d prior requests)", path, self.stats.total_requests)
 
     def get_stats(self) -> dict:
@@ -430,10 +502,12 @@ class SteeringEngine:
             "pair_replay_size": len(self._prompt_pair_replay),
             "energy_history_len": len(self.stats.energy_history),
             "retrieval_triggered_total": self.stats.retrieval_triggered_total,
+            "deviation_routing_total": self.stats.deviation_routing_total,
             # Full histories for plotting
             "recon_energy_history": list(self.stats.recon_energy_history),
             "predict_energy_history": list(self.stats.predict_energy_history),
             "cosine_distance_history": list(self.stats.cosine_distance_history),
+            "deviation_match_history": list(self.stats.deviation_match_history),
         }
 
     def _compute_median(self) -> float:
