@@ -162,7 +162,44 @@ Session 3a revealed a critical problem: 14 of 20 turns hit the 1.5 temperature c
 | Temperatures at ceiling | 14/20 | 3/20 |
 | Range | {0.500, 1.000, 1.500} | [0.918, 1.496] |
 
-The adaptive IQR scale auto-calibrates to any model's energy distribution. No manual tuning required.
+The per-turn comparison shows the fix working across every domain:
+
+| Turn | Domain | Blended | Temp (3a) | Temp (3b) | Change |
+|------|--------|---------|-----------|-----------|--------|
+| 1 | CS/Rust | 3235 | 1.000 | 1.000 | -- |
+| 2 | CS/Mutex | 3304 | 0.500 | 1.005 | +0.505 |
+| 3 | CS/GC | 4044 | 1.000 | 1.110 | +0.110 |
+| 4 | Phil/Kant | 3401 | 1.500 | 1.088 | -0.412 |
+| 5 | Phil/Sartre | 3392 | 1.500 | 1.000 | -0.500 |
+| 6 | Phil/Consc. | 4968 | 1.500 | 1.496 | -0.004 |
+| 7 | Cook/Soup | 3413 | 1.500 | 1.015 | -0.485 |
+| 8 | Cook/Bread | 5887 | 1.500 | 1.496 | -0.004 |
+| 9 | Sci/Quantum | 4191 | 1.500 | 1.375 | -0.125 |
+| 10 | Sci/CRISPR | 3270 | 1.500 | 0.918 | -0.582 |
+| 11 | Sci/Climate | 4121 | 1.500 | 1.352 | -0.148 |
+| 12 | CS/TCP | 4235 | 1.500 | 1.272 | -0.228 |
+| 13 | CS/Hash | 5657 | 1.500 | 1.479 | -0.021 |
+| 14 | Hist/2008 | 4151 | 1.500 | 1.041 | -0.459 |
+| 15 | Hist/Westph. | 4961 | 1.500 | 1.302 | -0.198 |
+| 16 | Art/Mixed | 5737 | 0.500 | 1.386 | +0.886 |
+| 17 | AI/Mixed | 4059 | 0.500 | 0.980 | +0.480 |
+| 18 | CS/Rust | 4038 | 0.500 | 0.981 | +0.481 |
+| 19 | Phil/Kant | 4139 | 1.500 | 1.008 | -0.492 |
+| 20 | Cook/Kimchi | 5002 | 1.500 | 1.255 | -0.245 |
+
+Session 3a had three temperatures because it was a two-state system: above median saturated to 1.5, below median saturated to 0.5, and the first turn defaulted to 1.0. Session 3b's IQR scaling recovers the full dynamic range. The temperature distribution shifts from binary to continuous:
+
+| Bucket | Session 3a | Session 3b |
+|--------|-----------|-----------|
+| <0.8 | 4 | 0 |
+| 0.8-1.0 | 0 | 3 |
+| 1.0-1.2 | 2 | 8 |
+| 1.2-1.4 | 0 | 6 |
+| >1.4 | 14 | 3 |
+
+Session 4's results depend on this fix. Without adaptive IQR scaling, temperature is meaningless noise — the system has no way to express graded confidence. With it, the temperature carries real information about where the current turn sits in the session's energy distribution. The IQR scale auto-calibrates to any model's energy regime without manual tuning.
+
+Full telemetry: `docs/session3b_telemetry.json` (20 turns, all metrics except deviation vectors).
 
 ### Session 4: Off-Corpus Generalization (20 turns, 2026-02-27)
 
@@ -377,7 +414,18 @@ Telemetry records are written in a try/except with logged exceptions. A telemetr
 
 ### Why invert RAG?
 
-In traditional RAG, the LLM decides when to retrieve (or retrieval happens unconditionally). This conflates the decision-maker with the text generator. PCDC separates these concerns: the PCHead (a dedicated dynamics-observing network) makes retrieval decisions based on energy and deviation signals. The LLM just generates text from whatever prompt it receives. This separation enables retrieval decisions based on information the LLM cannot access (settling dynamics, deviation fingerprints, energy history).
+The argument goes deeper than separation of concerns. The PCHead has access to information the LLM fundamentally cannot have.
+
+An LLM can only reason about retrieval using the tokens in its context window. It sees text. It can generate a search query from that text. But it has no access to the geometry of the embedding space, no model of how surprising this transition is relative to the session's history, no fingerprint of how a dedicated dynamical system *reacted* to this input versus previous inputs. These are different information streams entirely.
+
+The PCHead reasons about retrieval using:
+- **Settling dynamics** — how much energy was required to process this input through a learned bottleneck
+- **The energy landscape** — where this turn sits relative to the running distribution of all prior turns
+- **Deviation history** — whether the network's prediction error pattern on this input structurally resembles its reaction to past inputs
+
+None of these signals exist in token space. An LLM generating a retrieval query is working with surface-level lexical and semantic content. The PCHead is working with the geometry of a learned manifold and the dynamics of a physical settling process. These are complementary information sources, and PCDC is (to our knowledge) the first architecture that gives the retrieval decision to a dedicated dynamical system rather than the text generator.
+
+The practical consequence: the PCHead can detect that two inputs are "the same kind of thing" (via deviation matching) even when their surface text is completely different — a question about cricket and a question about knitting both trigger similar deviation patterns, not because they're lexically similar, but because the PCHead's learned model processes them through similar attractor basins. An LLM-driven retrieval system would never connect these inputs.
 
 ---
 
@@ -390,6 +438,8 @@ In traditional RAG, the LLM decides when to retrieve (or retrieval happens uncon
 **How does the energy distribution change over hundreds of turns?** The adaptive IQR scale handles short sessions well, but over very long sessions the IQR itself might drift, potentially requiring a decay or windowing mechanism.
 
 **Can deviation-matched text serve as the retrieval query?** Currently, deviation routing *gates* retrieval (decides whether to trigger) but the user's prompt provides the query content. If the replay buffer stored text alongside embeddings, the matched entry's text could serve as the query — potentially retrieving more relevant context than the user's surface-level question.
+
+**Should deviation routing be energy-conditional?** Session 4 showed that deviation matches are consistently high (avg 0.73) regardless of whether the content is novel or routine. A pure threshold on match score would trigger retrieval on nearly every turn — the pre-trained PCHead produces structured deviations everywhere, so matches are always strong. The useful retrieval gate is probably match score AND energy: "I recognise this pattern AND it's surprising." The architecture already computes both signals; the gating logic just needs to combine them. Something like `if match > threshold AND energy > percentile` would fire only when a familiar-looking pattern arrives in an unexpected context — which is precisely when retrieved context is most likely to be useful.
 
 **Is manifold alignment achievable?** Ghost Mic Mode A showed that the PCHead's output manifold is disjoint from the LLM's residual stream. A trained adapter matrix could bridge this gap, enabling direct logit-space steering (v2). The question is whether this can be done without degrading the PCHead's deviation structure.
 
