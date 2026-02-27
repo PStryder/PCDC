@@ -200,11 +200,26 @@ def pretrain(
     # --- Restore eta_w ---
     pc_head.config.eta_w = original_eta_w
 
+    # --- Compute deviations for each embedding (post-training) ---
+    print(f"\nComputing deviations for {len(embeddings)} embeddings...")
+    deviations = []
+    with torch.no_grad():
+        for emb in embeddings:
+            x = emb.unsqueeze(0).to(device)
+            settled, _ = pc_head.infer(x)
+            dev = (settled.squeeze(0) - emb.to(device)).detach().cpu()
+            deviations.append(dev)
+
+    dev_norms = torch.tensor([d.norm().item() for d in deviations])
+    print(f"  Deviation norms: mean={dev_norms.mean():.1f}, std={dev_norms.std():.1f}, "
+          f"range=[{dev_norms.min():.1f}, {dev_norms.max():.1f}]")
+
     # --- Save checkpoint ---
     print(f"\nSaving checkpoint to {output_path}...")
     data = {
         "pc_head_state_dict": pc_head.state_dict(),
         "prompt_replay": [e.detach().cpu() for e in embeddings],
+        "prompt_deviation_replay": deviations,
         "prompt_pair_replay": [
             (embeddings[i].detach().cpu(), embeddings[i + 1].detach().cpu())
             for i in range(len(embeddings) - 1)
@@ -219,7 +234,7 @@ def pretrain(
         },
     }
     torch.save(data, output_path)
-    print(f"  Saved ({len(embeddings)} replay embeddings, "
+    print(f"  Saved ({len(embeddings)} replay embeddings, {len(deviations)} deviations, "
           f"{len(embeddings) - 1} transition pairs)")
 
 

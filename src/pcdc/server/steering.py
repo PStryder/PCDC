@@ -116,6 +116,7 @@ class SteeringEngine:
         self._prev_embedding: Tensor | None = None
         self._prompt_replay: list[Tensor] = []
         self._prompt_pair_replay: list[tuple[Tensor, Tensor]] = []
+        self._prompt_deviation_replay: list[Tensor] = []  # deviation vectors parallel to _prompt_replay
 
     def steer(self, prompt_text: str, base_temp: float = 1.0) -> SteeringResult:
         """Run PCHead settling on prompt embedding, return steering result."""
@@ -313,59 +314,61 @@ class SteeringEngine:
             with torch.no_grad():
                 steering_vector, infer_metrics = self.pc_head.infer(x_input)
 
-            # --- Deviation routing ---
+            # --- Compute and store deviation ---
             deviation_match_score = None
             deviation_match_idx = None
 
+            with torch.no_grad():
+                deviation = steering_vector.squeeze(0) - embedding.to(device)
+                current_deviation = deviation.detach().cpu()
+
+            # --- Deviation routing (deviation-to-deviation comparison) ---
             if (
                 self._deviation_routing_enabled
-                and len(self._prompt_replay) >= 10
+                and len(self._prompt_deviation_replay) >= 10
             ):
-                with torch.no_grad():
-                    deviation = steering_vector.squeeze(0) - embedding.to(device)
-                    dev_norm = deviation.norm()
-                    if dev_norm > 1e-8:
-                        dev_unit = deviation / dev_norm
-                        # Batch cosine similarity against replay buffer (all on CPU to avoid VRAM)
-                        replay_stack = torch.stack(self._prompt_replay)  # (N, D) — already CPU
-                        dev_cpu = dev_unit.detach().cpu()
-                        cos_scores = torch.nn.functional.cosine_similarity(
-                            dev_cpu.unsqueeze(0), replay_stack,
-                        )  # (N,)
-                        best_score_t, best_idx_t = cos_scores.max(dim=0)
-                        deviation_match_score = best_score_t.item()
-                        deviation_match_idx = best_idx_t.item()
+                dev_norm = current_deviation.norm()
+                if dev_norm > 1e-8:
+                    dev_unit = current_deviation / dev_norm
+                    # Batch cosine similarity against stored deviations (all CPU)
+                    dev_replay_stack = torch.stack(self._prompt_deviation_replay)  # (N, D)
+                    cos_scores = torch.nn.functional.cosine_similarity(
+                        dev_unit.unsqueeze(0), dev_replay_stack,
+                    )  # (N,)
+                    best_score_t, best_idx_t = cos_scores.max(dim=0)
+                    deviation_match_score = best_score_t.item()
+                    deviation_match_idx = best_idx_t.item()
 
-                        self.stats.deviation_match_history.append(deviation_match_score)
+                    self.stats.deviation_match_history.append(deviation_match_score)
 
-                        # Gate retrieval on deviation match
-                        if (
-                            deviation_match_score > self._deviation_routing_threshold
-                            and self._memory_client is not None
-                            and self._format_prompt_fn is not None
-                            and messages is not None
-                            and not retrieval_triggered  # don't double-trigger
-                        ):
-                            retrieval_query = _extract_last_user_content(messages)
-                            if retrieval_query:
-                                results = self._memory_client.search(
-                                    query=retrieval_query,
-                                    limit=self._retrieval_limit,
-                                    min_confidence=self._retrieval_min_confidence,
+                    # Gate retrieval on deviation match
+                    if (
+                        deviation_match_score > self._deviation_routing_threshold
+                        and self._memory_client is not None
+                        and self._format_prompt_fn is not None
+                        and messages is not None
+                        and not retrieval_triggered  # don't double-trigger
+                    ):
+                        retrieval_query = _extract_last_user_content(messages)
+                        if retrieval_query:
+                            results = self._memory_client.search(
+                                query=retrieval_query,
+                                limit=self._retrieval_limit,
+                                min_confidence=self._retrieval_min_confidence,
+                            )
+                            if results:
+                                retrieval_triggered = True
+                                retrieval_count = len(results)
+                                self.stats.retrieval_triggered_total += 1
+                                self.stats.deviation_routing_total += 1
+                                augmented_prompt = self._format_prompt_fn(messages, results)
+                                _, tokens = self.backend.embed_and_warm(augmented_prompt)
+                                logger.info(
+                                    "deviation_routing: triggered (score=%.4f idx=%d), "
+                                    "injected %d memory items",
+                                    deviation_match_score, deviation_match_idx,
+                                    retrieval_count,
                                 )
-                                if results:
-                                    retrieval_triggered = True
-                                    retrieval_count = len(results)
-                                    self.stats.retrieval_triggered_total += 1
-                                    self.stats.deviation_routing_total += 1
-                                    augmented_prompt = self._format_prompt_fn(messages, results)
-                                    _, tokens = self.backend.embed_and_warm(augmented_prompt)
-                                    logger.info(
-                                        "deviation_routing: triggered (score=%.4f idx=%d), "
-                                        "injected %d memory items",
-                                        deviation_match_score, deviation_match_idx,
-                                        retrieval_count,
-                                    )
 
             # Update running stats
             self.stats.total_requests += 1
@@ -411,6 +414,7 @@ class SteeringEngine:
             # --- Update replay buffers ---
             if len(self._prompt_replay) < self._replay_max:
                 self._prompt_replay.append(embedding.detach().cpu())
+                self._prompt_deviation_replay.append(current_deviation)
             if self._prev_embedding is not None and len(self._prompt_pair_replay) < self._replay_max:
                 self._prompt_pair_replay.append(
                     (self._prev_embedding.detach().cpu(), embedding.detach().cpu())
@@ -461,6 +465,7 @@ class SteeringEngine:
             "prev_embedding": self._prev_embedding,
             "prompt_replay": self._prompt_replay,
             "prompt_pair_replay": self._prompt_pair_replay,
+            "prompt_deviation_replay": self._prompt_deviation_replay,
             "stats_deviation_routing_total": self.stats.deviation_routing_total,
             "stats_deviation_match_history": list(self.stats.deviation_match_history),
         }
@@ -486,6 +491,7 @@ class SteeringEngine:
         self._prev_embedding = data.get("prev_embedding", None)
         self._prompt_replay = data.get("prompt_replay", [])
         self._prompt_pair_replay = data.get("prompt_pair_replay", [])
+        self._prompt_deviation_replay = data.get("prompt_deviation_replay", [])
         self.stats.deviation_routing_total = data.get("stats_deviation_routing_total", 0)
         dev_match_history = data.get("stats_deviation_match_history", [])
         self.stats.deviation_match_history = deque(dev_match_history, maxlen=1000)
@@ -499,6 +505,7 @@ class SteeringEngine:
             "predict_energy_median": self._compute_median_from(self.stats.predict_energy_history),
             "replay_buffer_size": len(self._replay),
             "prompt_replay_size": len(self._prompt_replay),
+            "deviation_replay_size": len(self._prompt_deviation_replay),
             "pair_replay_size": len(self._prompt_pair_replay),
             "energy_history_len": len(self.stats.energy_history),
             "retrieval_triggered_total": self.stats.retrieval_triggered_total,
