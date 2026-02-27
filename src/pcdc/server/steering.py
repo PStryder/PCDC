@@ -80,6 +80,8 @@ class SteeringEngine:
         # Deviation routing
         deviation_routing_enabled: bool = False,
         deviation_routing_threshold: float = 0.6,
+        # Telemetry
+        telemetry_db: Any = None,
     ):
         self.backend = backend
         self.pc_head = pc_head
@@ -104,6 +106,9 @@ class SteeringEngine:
         # Deviation routing
         self._deviation_routing_enabled = deviation_routing_enabled
         self._deviation_routing_threshold = deviation_routing_threshold
+
+        # Telemetry
+        self._telemetry_db = telemetry_db
 
         self._lock = threading.Lock()
         self.stats = SteeringStats()
@@ -410,6 +415,27 @@ class SteeringEngine:
                 deviation_match_score=deviation_match_score,
                 deviation_match_idx=deviation_match_idx,
             )
+
+            # --- Telemetry ---
+            if self._telemetry_db is not None:
+                try:
+                    dev_np = current_deviation.numpy().astype("float32")
+                    self._telemetry_db.record_turn(
+                        energy_recon=e_recon,
+                        energy_predict=e_predict,
+                        energy_blended=energy,
+                        cosine_distance=cosine_dist,
+                        deviation_norm=current_deviation.norm().item(),
+                        deviation_vector=dev_np.tobytes(),
+                        top_match_score=deviation_match_score,
+                        top_match_idx=deviation_match_idx,
+                        adjusted_temp=adjusted,
+                        converged=converged,
+                        settle_steps=total_steps,
+                        retrieval_triggered=retrieval_triggered,
+                    )
+                except Exception:
+                    logger.exception("Telemetry recording failed")
 
             # --- Update replay buffers ---
             if len(self._prompt_replay) < self._replay_max:

@@ -123,6 +123,14 @@ src/pcdc/
 ├── scripts/
 │   └── plot_session.py            # Plot energy histories + cosine distances from server stats
 │
+├── data/
+│   └── bootstrap_corpus.txt       # Diverse text corpus for PCHead pre-training
+│
+scripts/                               # Standalone experiment and utility scripts
+├── pretrain_pchead.py                 # Offline PCHead pre-training for attractor basins
+├── ghost_mic.py                       # Deviation vector analysis experiments
+└── plot_session.py                    # Session energy visualization
+│
 ├── training/                      # Training loops and evaluation
 │   ├── train_mnist_pc.py          # PC training loop on MNIST
 │   ├── baseline_mlp_backprop.py   # Standard backprop MLP for comparison
@@ -254,9 +262,28 @@ energy = β * E_recon + (1-β) * E_predict
 temp = base_temp * (1 + α * tanh((energy - median) / scale))
 ```
 
-After both training phases, `infer()` runs on the updated weights to produce a steering vector (available for future logit biasing).
+After both training phases, `infer()` runs on the updated weights to produce a steering vector and a deviation vector (`settled - original`), which is used by deviation routing (see below).
 
 **Tuning insight:** At `eta_w=1e-4`, energy declines monotonically (~17% over 8 turns) regardless of topic shifts — the network adapts faster than novelty can register. At `eta_w=1e-5`, decline is only ~2.5% over 12 turns, energy responds to domain shifts, and temperature actually varies (0.35–1.05 vs stuck at 0.35). See `docs/session2_energy_plot.png` for the comparison.
+
+### Deviation Routing
+
+After settling, the PCHead produces a deviation vector: `deviation = settled_state - original_embedding`. This vector encodes what the network "wanted to change" about the input — its prediction error fingerprint.
+
+Deviation routing compares the current turn's deviation against stored deviations from all previous turns (deviation-to-deviation cosine similarity). When a match exceeds the threshold, it triggers MemoryGate retrieval — the PCHead's prediction errors drive memory recall:
+
+```
+deviation = settled - embedding
+cos_scores = cosine_similarity(deviation, stored_deviations)
+if max(cos_scores) > threshold:
+    trigger MemoryGate retrieval
+```
+
+This creates a second retrieval pathway independent of energy thresholds. Energy-based retrieval fires on novelty (high energy = unfamiliar content). Deviation routing fires on structural similarity (similar prediction error pattern = similar type of content, even if energy is normal).
+
+**Pre-training is required** for deviation routing to work. Without it, all deviations are near-orthogonal (cosine ~0.05-0.09) because the attractor basins haven't formed. After pre-training on the bootstrap corpus, cosine similarities reach 0.49-0.65 with semantic domain matching (e.g., a Rust question matches the Rust corpus paragraph at cos=0.654).
+
+Enable with `--pc-deviation-routing --pc-deviation-threshold 0.4`.
 
 ### Energy-Triggered Memory Retrieval
 
@@ -283,19 +310,30 @@ The MemoryGate client (`memory_client.py`) calls via MCP JSON-RPC over HTTP. All
 ```bash
 uv sync --extra server
 
-# Basic — no retrieval
-uv run pcdc-serve \
+# Step 1: Pre-train PCHead (recommended before first use)
+python scripts/pretrain_pchead.py \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
-    --pc-checkpoint pchead.ckpt
+    --corpus data/bootstrap_corpus.txt \
+    --epochs 5 \
+    --batch-size 8 \
+    --output pchead_pretrained.ckpt
 
-# With MemoryGate retrieval + tuned parameters
+# Step 2: Serve (basic — no retrieval)
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
-    --pc-checkpoint pchead.ckpt \
+    --pc-checkpoint pchead_pretrained.ckpt
+
+# Full stack: pre-trained checkpoint + deviation routing + MemoryGate
+uv run pcdc-serve \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --pc-checkpoint pchead_pretrained.ckpt \
     --pc-online-eta-w 0.00001 \
     --pc-settle-k 100 \
+    --pc-deviation-routing \
+    --pc-deviation-threshold 0.4 \
     --mg-url http://localhost:8080/mcp \
     --mg-predict-percentile 95
 
@@ -329,7 +367,8 @@ Responses include a `pcdc` metadata field:
   "settle_steps": 200,
   "cosine_distance": 0.280,
   "retrieval_triggered": false,
-  "retrieval_count": 0
+  "retrieval_count": 0,
+  "deviation_match_score": 0.654
 }
 ```
 
@@ -364,6 +403,8 @@ uv run pcdc-serve \
     --mg-predict-percentile 95      # Dynamic predict threshold as percentile of history
     --mg-retrieval-limit 3          # Max memory items to retrieve
     --mg-retrieval-min-confidence 0.5  # Min confidence for retrieved memories
+    --pc-deviation-routing          # Enable deviation-based retrieval routing
+    --pc-deviation-threshold 0.6    # Cosine similarity threshold for deviation routing
     --log-level INFO                # Log level
 ```
 
@@ -461,20 +502,41 @@ uv run pcdc-continual \
     --seed 42 \
     --output-dir ./experiments
 
+# Pre-train PCHead offline
+python scripts/pretrain_pchead.py \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --corpus data/bootstrap_corpus.txt \
+    --epochs 5 \
+    --batch-size 8 \
+    --settle-k 50 \
+    --eta-w 0.0001 \
+    --output pchead_pretrained.ckpt
+
+# Ghost Mic experiment (deviation analysis)
+python scripts/ghost_mic.py \
+    --model path/to/model.gguf \
+    --n-gpu-layers 33 \
+    --checkpoint pchead_pretrained.ckpt \
+    --prompt "Explain Rust's ownership model" \
+    --mode b
+
 # Chat API server (basic)
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
-    --pc-checkpoint pchead.ckpt \
+    --pc-checkpoint pchead_pretrained.ckpt \
     --port 8000
 
-# Chat API server (with MemoryGate retrieval + tuned parameters)
+# Chat API server (full stack)
 uv run pcdc-serve \
     --model path/to/model.gguf \
     --n-gpu-layers 33 \
-    --pc-checkpoint pchead.ckpt \
+    --pc-checkpoint pchead_pretrained.ckpt \
     --pc-online-eta-w 0.00001 \
     --pc-settle-k 100 \
+    --pc-deviation-routing \
+    --pc-deviation-threshold 0.4 \
     --mg-url http://localhost:8080/mcp \
     --mg-predict-percentile 95
 ```
@@ -497,10 +559,20 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - PCHead checkpoint save/load with full replay state across server restarts
 - Plotting script for energy and cosine distance visualization (`scripts/plot_session.py`)
 - Validated across two live sessions: eta_w=1e-5 preserves novelty sensitivity over 12+ turns
+- Offline pre-training bootstraps attractor basins from a text corpus (`scripts/pretrain_pchead.py`)
+- Deviation routing: deviation-to-deviation cosine similarity triggers memory retrieval based on prediction error fingerprints
+- Pre-trained deviations show semantic domain matching (Rust prompt matches Rust paragraph at cos=0.654, philosophy matches philosophy at cos=0.608)
+- Ghost Mic experiment validates deviation routing end-to-end (`scripts/ghost_mic.py`)
+- Dual replay buffers (embeddings + deviations) persist through checkpoints and survive server restarts
 
 **What's next:**
+- Store text alongside deviation replay entries so deviation-matched text can be used as retrieval query directly (currently the user's prompt is used)
 - Cosine distance as third retrieval gate signal (high cos_dist = domain shift)
-- v2 steering: project steering vector → logit bias via LLM embedding matrix
+- v2 steering: project steering vector into logit bias via trained adapter (lm_head projection produces noise without manifold alignment)
 - Run MNIST to convergence and tune hyperparameters for >90% accuracy
 - End-to-end GGUF continual learning with a real model
 - Benchmark forgetting: PCHead vs baselines across task sequences
+
+## Documentation
+
+- [System Architecture](docs/system_architecture.md) — detailed explanation of how all components work together

@@ -60,6 +60,8 @@ class ServerConfig:
     # Deviation routing
     pc_deviation_routing: bool = False
     pc_deviation_threshold: float = 0.6
+    # Telemetry
+    telemetry_db: str | None = None
 
 
 # Llama-3 chat template
@@ -143,6 +145,13 @@ def create_app(config: ServerConfig) -> FastAPI:
             )
             logger.info("MemoryGate client initialized: %s", config.mg_url)
 
+        # Telemetry DB (optional — only created when --telemetry-db is set)
+        telemetry = None
+        if config.telemetry_db:
+            from pcdc.server.telemetry_db import TelemetryDB
+            telemetry = TelemetryDB(config.telemetry_db)
+            logger.info("TelemetryDB initialized: %s", config.telemetry_db)
+
         engine = SteeringEngine(
             backend=backend,
             pc_head=pc_head,
@@ -161,6 +170,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             format_prompt_fn=format_augmented_prompt if memory_client else None,
             deviation_routing_enabled=config.pc_deviation_routing,
             deviation_routing_threshold=config.pc_deviation_threshold,
+            telemetry_db=telemetry,
         )
 
         # Load checkpoint if provided
@@ -192,6 +202,8 @@ def create_app(config: ServerConfig) -> FastAPI:
             engine.save_checkpoint(config.pc_checkpoint)
         if memory_client:
             memory_client.close()
+        if telemetry:
+            telemetry.close()
         logger.info("Shutting down PCDC server")
 
     app = FastAPI(title="PCDC Chat API", lifespan=lifespan)
@@ -429,6 +441,8 @@ def main():
     # Deviation routing
     parser.add_argument("--pc-deviation-routing", action="store_true", default=False, help="Enable deviation-based retrieval routing")
     parser.add_argument("--pc-deviation-threshold", type=float, default=0.6, help="Cosine similarity threshold for deviation routing (default: 0.6)")
+    # Telemetry
+    parser.add_argument("--telemetry-db", default=None, help="Path to SQLite telemetry database (default: disabled)")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
     args = parser.parse_args()
 
@@ -461,6 +475,7 @@ def main():
         mg_retrieval_min_confidence=args.mg_retrieval_min_confidence,
         pc_deviation_routing=args.pc_deviation_routing,
         pc_deviation_threshold=args.pc_deviation_threshold,
+        telemetry_db=args.telemetry_db,
     )
 
     import uvicorn
