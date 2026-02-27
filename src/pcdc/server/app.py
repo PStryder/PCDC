@@ -42,7 +42,7 @@ class ServerConfig:
     port: int = 8000
     pc_hidden_sizes: list[int] | None = None
     pc_alpha: float = 0.5
-    pc_energy_scale: float = 1.0
+    pc_energy_scale: float = 0.0
     pc_checkpoint: str | None = None
     pc_beta: float = 0.5
     pc_online_eta_w: float = 0.0001
@@ -423,7 +423,7 @@ def main():
     parser.add_argument("--n-threads", type=int, default=8, help="CPU threads")
     parser.add_argument("--n-gpu-layers", type=int, default=0, help="GPU offload layers")
     parser.add_argument("--pc-alpha", type=float, default=0.5, help="Energy-temperature coupling strength")
-    parser.add_argument("--pc-energy-scale", type=float, default=1.0, help="Energy normalization scale")
+    parser.add_argument("--pc-energy-scale", type=float, default=0.0, help="Energy normalization scale (0 = adaptive IQR, default)")
     parser.add_argument("--pc-checkpoint", default=None, help="Path to save/load PCHead checkpoint (auto-saves on shutdown)")
     parser.add_argument("--pc-beta", type=float, default=0.5, help="Blend ratio: energy = beta*E_recon + (1-beta)*E_predict (default: 0.5)")
     parser.add_argument("--pc-online-eta-w", type=float, default=0.0001, help="Online learning rate for train_step phases (default: 0.0001)")

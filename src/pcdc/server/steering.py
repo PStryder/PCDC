@@ -62,7 +62,7 @@ class SteeringEngine:
         backend: GGUFBackend,
         pc_head: PCHead,
         alpha: float = 0.5,
-        energy_scale: float = 1.0,
+        energy_scale: float = 0.0,
         temp_min: float = 0.1,
         temp_max: float = 2.0,
         beta: float = 0.5,
@@ -143,13 +143,13 @@ class SteeringEngine:
 
         # Energy → temperature
         median = self.stats.energy_median
-        scale = self.energy_scale if self.energy_scale > 0 else 1.0
+        scale = self._effective_scale(self.stats.energy_history)
         adjusted = base_temp * (1.0 + self.alpha * math.tanh((energy - median) / scale))
         adjusted = max(self.temp_min, min(self.temp_max, adjusted))
 
         logger.info(
-            "steer: energy=%.4f median=%.4f base_temp=%.2f adjusted_temp=%.3f converged=%s steps=%d",
-            energy, median, base_temp, adjusted, metrics.converged, metrics.steps_used,
+            "steer: energy=%.4f median=%.4f scale=%.1f base_temp=%.2f adjusted_temp=%.3f converged=%s steps=%d",
+            energy, median, scale, base_temp, adjusted, metrics.converged, metrics.steps_used,
         )
 
         return SteeringResult(
@@ -386,15 +386,15 @@ class SteeringEngine:
 
             # Energy → temperature
             median = self.stats.energy_median
-            scale = self.energy_scale if self.energy_scale > 0 else 1.0
+            scale = self._effective_scale(self.stats.energy_history)
             adjusted = base_temp * (1.0 + self.alpha * math.tanh((energy - median) / scale))
             adjusted = max(self.temp_min, min(self.temp_max, adjusted))
 
             logger.info(
                 "steer_and_generate: e_recon=%.4f e_predict=%.4f blended=%.4f "
-                "median=%.4f base=%.2f adj=%.3f converged=%s steps=%d "
+                "median=%.4f scale=%.1f base=%.2f adj=%.3f converged=%s steps=%d "
                 "cos_dist=%s retrieval=%s",
-                e_recon, e_predict, energy, median, base_temp, adjusted,
+                e_recon, e_predict, energy, median, scale, base_temp, adjusted,
                 converged, total_steps,
                 f"{cosine_dist:.6f}" if cosine_dist is not None else "N/A",
                 retrieval_triggered,
@@ -542,6 +542,30 @@ class SteeringEngine:
             "cosine_distance_history": list(self.stats.cosine_distance_history),
             "deviation_match_history": list(self.stats.deviation_match_history),
         }
+
+    def _effective_scale(self, history: deque) -> float:
+        """Return the energy scale for the tanh temperature mapping.
+
+        If ``energy_scale`` was set to a positive value, use it directly.
+        Otherwise compute an adaptive scale from the IQR of the energy
+        history so the tanh input is normalised to roughly [-2, 2] and
+        the temperature uses the full [temp_min, temp_max] range.
+
+        Falls back to the median itself (or 1.0) when there aren't
+        enough samples yet.
+        """
+        if self.energy_scale > 0:
+            return self.energy_scale
+        if len(history) < 4:
+            # Not enough data for IQR — use median as rough scale
+            m = self._compute_median_from(history)
+            return m if m > 0 else 1.0
+        q25 = self._compute_percentile(history, 25)
+        q75 = self._compute_percentile(history, 75)
+        iqr = q75 - q25
+        # Scale so that +/- 1 IQR from median maps to tanh(+/- 1) ≈ +/- 0.76
+        # giving meaningful gradation across the middle of the distribution
+        return max(iqr, 1.0)
 
     def _compute_median(self) -> float:
         return self._compute_median_from(self.stats.energy_history)
