@@ -42,12 +42,15 @@ def plot(stats: dict, output: str | None = None):
         ax1.plot(turns[:len(predict)], predict, "s-", color="#3498db", label="E_predict (transition surprise)", linewidth=2)
 
     # Mark crossover points
+    crossing_label_used = False
     for i in range(len(recon)):
         if i < len(predict) and i > 0:
             prev_diff = recon[i - 1] - predict[i - 1]
             curr_diff = recon[i] - predict[i]
             if prev_diff * curr_diff < 0:  # sign change = crossover
-                ax1.axvline(x=turns[i], color="#e67e22", linestyle="--", alpha=0.7, label="Signal crossing")
+                label = "Signal crossing" if not crossing_label_used else None
+                crossing_label_used = True
+                ax1.axvline(x=turns[i], color="#e67e22", linestyle="--", alpha=0.7, label=label)
 
     ax1.set_ylabel("Energy", fontsize=12)
     ax1.set_title("Two-Phase Settling Energy Over Time", fontsize=14)
