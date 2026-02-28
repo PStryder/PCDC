@@ -117,7 +117,10 @@ def train_baseline_on_features(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     dataset = TensorDataset(features, labels)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    if len(dataset) == 0:
+        return []
 
     losses = []
     for epoch in range(epochs):
@@ -155,7 +158,7 @@ def train_baseline_on_features(
             epoch_loss += loss.item() * batch_feats.size(0)
             n += batch_feats.size(0)
 
-        losses.append(epoch_loss / n)
+        losses.append(epoch_loss / n if n > 0 else 0.0)
 
     return losses
 

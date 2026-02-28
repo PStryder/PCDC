@@ -231,41 +231,42 @@ class SteeringEngine:
             if self.settle_k is not None:
                 self.pc_head.config.K = self.settle_k
 
-            # --- Phase 1: Reconstruction settle ---
-            recon_batch = [x_input]
-            if self._prompt_replay:
-                k = min(self.replay_k, len(self._prompt_replay))
-                samples = random.sample(self._prompt_replay, k)
-                recon_batch.extend(s.unsqueeze(0).to(device) for s in samples)
-            recon_input = torch.cat(recon_batch, dim=0)
-            recon_metrics = self.pc_head.train_step(recon_input, recon_input)
-            e_recon = recon_metrics["energy"]
+            try:
+                # --- Phase 1: Reconstruction settle ---
+                recon_batch = [x_input]
+                if self._prompt_replay:
+                    k = min(self.replay_k, len(self._prompt_replay))
+                    samples = random.sample(self._prompt_replay, k)
+                    recon_batch.extend(s.unsqueeze(0).to(device) for s in samples)
+                recon_input = torch.cat(recon_batch, dim=0)
+                recon_metrics = self.pc_head.train_step(recon_input, recon_input)
+                e_recon = recon_metrics["energy"]
 
-            # --- Phase 2: Predictive settle ---
-            if self._prev_embedding is not None:
-                prev = self._prev_embedding.unsqueeze(0).to(device)
-                pred_prev_batch = [prev]
-                pred_curr_batch = [x_input]
-                if self._prompt_pair_replay:
-                    k = min(self.replay_k, len(self._prompt_pair_replay))
-                    pairs = random.sample(self._prompt_pair_replay, k)
-                    for p, c in pairs:
-                        pred_prev_batch.append(p.unsqueeze(0).to(device))
-                        pred_curr_batch.append(c.unsqueeze(0).to(device))
-                pred_input = torch.cat(pred_prev_batch, dim=0)
-                pred_target = torch.cat(pred_curr_batch, dim=0)
-                pred_metrics = self.pc_head.train_step(pred_input, pred_target)
-                e_predict = pred_metrics["energy"]
-                total_steps = recon_metrics["settle_steps"] + pred_metrics["settle_steps"]
-                converged = recon_metrics["converged"] and pred_metrics["converged"]
-            else:
-                e_predict = e_recon
-                total_steps = recon_metrics["settle_steps"]
-                converged = recon_metrics["converged"]
-
-            # --- Restore learning rate + settle steps ---
-            self.pc_head.config.eta_w = original_eta_w
-            self.pc_head.config.K = original_K
+                # --- Phase 2: Predictive settle ---
+                if self._prev_embedding is not None:
+                    prev = self._prev_embedding.unsqueeze(0).to(device)
+                    pred_prev_batch = [prev]
+                    pred_curr_batch = [x_input]
+                    if self._prompt_pair_replay:
+                        k = min(self.replay_k, len(self._prompt_pair_replay))
+                        pairs = random.sample(self._prompt_pair_replay, k)
+                        for p, c in pairs:
+                            pred_prev_batch.append(p.unsqueeze(0).to(device))
+                            pred_curr_batch.append(c.unsqueeze(0).to(device))
+                    pred_input = torch.cat(pred_prev_batch, dim=0)
+                    pred_target = torch.cat(pred_curr_batch, dim=0)
+                    pred_metrics = self.pc_head.train_step(pred_input, pred_target)
+                    e_predict = pred_metrics["energy"]
+                    total_steps = recon_metrics["settle_steps"] + pred_metrics["settle_steps"]
+                    converged = recon_metrics["converged"] and pred_metrics["converged"]
+                else:
+                    e_predict = e_recon
+                    total_steps = recon_metrics["settle_steps"]
+                    converged = recon_metrics["converged"]
+            finally:
+                # --- Restore learning rate + settle steps (even on exception) ---
+                self.pc_head.config.eta_w = original_eta_w
+                self.pc_head.config.K = original_K
 
             # --- Blend energies ---
             energy = self.beta * e_recon + (1.0 - self.beta) * e_predict
@@ -501,7 +502,7 @@ class SteeringEngine:
     def load_checkpoint(self, path: str) -> None:
         """Load PCHead weights, steering stats, and replay state from disk."""
         import torch
-        data = torch.load(path, weights_only=False)
+        data = torch.load(path, weights_only=True)
         self.pc_head.load_state_dict(data["pc_head_state_dict"])
         self.pc_head.eval()
         self.stats.total_requests = data.get("stats_total_requests", 0)

@@ -82,15 +82,26 @@ def format_llama3_prompt(messages: list[ChatMessage]) -> str:
     return "".join(parts)
 
 
+def _sanitize_template_text(text: str) -> str:
+    """Strip Llama-3 special tokens to prevent prompt-template injection."""
+    for token in ("<|begin_of_text|>", "<|end_of_text|>",
+                  "<|start_header_id|>", "<|end_header_id|>",
+                  "<|eot_id|>"):
+        text = text.replace(token, "")
+    return text
+
+
 def format_augmented_prompt(messages: list[dict], memory_results: list) -> str:
     """Rebuild Llama-3 prompt with retrieved memory context injected.
 
     Inserts a system message at position 0 containing the retrieved
     memory items, then re-formats the full message list.
+    Memory text is sanitized to prevent template-token injection.
     """
     context_lines = []
     for i, r in enumerate(memory_results, 1):
-        context_lines.append(f"[{i}] ({r.source_type}, conf={r.confidence:.2f}) {r.text}")
+        safe_text = _sanitize_template_text(r.text)
+        context_lines.append(f"[{i}] ({r.source_type}, conf={r.confidence:.2f}) {safe_text}")
     context_block = "\n".join(context_lines)
 
     context_msg = ChatMessage(
@@ -191,7 +202,7 @@ def create_app(config: ServerConfig) -> FastAPI:
                 try:
                     engine.save_checkpoint(config.pc_checkpoint)
                 except Exception:
-                    pass
+                    logger.exception("Failed to save checkpoint on exit to %s", config.pc_checkpoint)
             atexit.register(_save_on_exit)
 
         logger.info("PCDC server ready on %s:%d", config.host, config.port)
@@ -347,9 +358,18 @@ def create_app(config: ServerConfig) -> FastAPI:
         )
         yield json.dumps(first_chunk.model_dump(), ensure_ascii=False)
 
-        # Stream tokens (iterator holds the steering lock until exhausted)
+        # Stream tokens — pull from sync iterator via executor to avoid
+        # blocking the event loop while the LLM generates.
+        loop = asyncio.get_event_loop()
         collected_text = []
-        for chunk_data in stream:
+        sentinel = object()
+        stream_iter = iter(stream)
+
+        while True:
+            chunk_data = await loop.run_in_executor(None, next, stream_iter, sentinel)
+            if chunk_data is sentinel:
+                break
+
             content = chunk_data["choices"][0].get("text")
             finish_reason = chunk_data["choices"][0].get("finish_reason")
 

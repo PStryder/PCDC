@@ -5,13 +5,15 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
 # --- Request ---
 
 class ChatMessage(BaseModel):
-    role: str
+    role: Literal["system", "user", "assistant"]
     content: str
 
 

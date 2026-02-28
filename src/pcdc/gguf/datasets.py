@@ -55,6 +55,14 @@ class SplitDatasetSequence:
 
         # Determine class ordering
         all_classes = sorted(labels.unique().tolist())
+        num_classes = len(all_classes)
+        required = n_tasks * classes_per_task
+        if required > num_classes:
+            raise ValueError(
+                f"n_tasks * classes_per_task ({n_tasks} * {classes_per_task} = {required}) "
+                f"exceeds available classes ({num_classes})"
+            )
+
         rng = random.Random(seed)
         rng.shuffle(all_classes)
 

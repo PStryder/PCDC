@@ -340,7 +340,7 @@ def ghost_mic(
     if checkpoint_path:
         import os
         if os.path.exists(checkpoint_path):
-            checkpoint_data = torch.load(checkpoint_path, weights_only=False)
+            checkpoint_data = torch.load(checkpoint_path, weights_only=True)
             pc_head.load_state_dict(checkpoint_data["pc_head_state_dict"])
             print(f"  PCHead loaded from {checkpoint_path}")
             n_replay = len(checkpoint_data.get("prompt_replay", []))
