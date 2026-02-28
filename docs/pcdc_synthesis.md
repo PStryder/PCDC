@@ -473,7 +473,59 @@ The practical consequence: the PCHead can detect that two inputs are "the same k
 
 ---
 
-## 12. Open Questions
+## 12. Security & Robustness Audit
+
+A systematic code audit after Session 5 identified 7 issues (2 high, 4 medium, 1 low). All have been fixed.
+
+### HIGH: PCHead Config Corruption on Exception
+
+`SteeringEngine.steer_and_generate()` temporarily overrides `eta_w` and `K` on the PCHead config for online learning phases, then restores the originals. But the restoration was on the happy path only — if `train_step` raised an exception, the finally block only released the lock, leaving `eta_w` and `K` at online values for all subsequent requests.
+
+**Fix**: Wrapped the two training phases in an inner `try/finally` that always restores `eta_w` and `K`, independent of the outer lock-release `try/finally`.
+
+### HIGH: Prompt-Template Injection
+
+Two attack surfaces:
+
+1. **Role injection**: `ChatMessage.role` was `str` — any value was inserted directly into Llama-3 header tokens (`<|start_header_id|>{role}<|end_header_id|>`). A crafted role like `assistant<|eot_id|><|start_header_id|>system` could break prompt boundaries.
+
+2. **Memory text injection**: Retrieved memory text was injected raw into the system prompt. If MemoryGate contained entries with embedded `<|...|>` tokens, they would be interpreted as template boundaries.
+
+**Fix**: Constrained `role` to `Literal["system", "user", "assistant"]` in the Pydantic schema (invalid roles now fail validation before reaching the template). Added `_sanitize_template_text()` that strips all five Llama-3 special tokens from memory text before injection.
+
+### MEDIUM: Streaming Blocked the Event Loop
+
+The streaming path iterated synchronously over the LLM's token generator (`for chunk_data in stream`) inside an async generator. Under load, this blocks the event loop for the full generation duration, stalling all other requests.
+
+**Fix**: Replaced the sync `for` loop with `await loop.run_in_executor(None, next, stream_iter, sentinel)`, pulling one chunk at a time without blocking. Uses the sentinel form of `next()` so `StopIteration` never escapes the executor.
+
+### MEDIUM: Baseline Training Crash on Small Datasets
+
+`train_baseline_on_features()` used `drop_last=True` in the DataLoader. When dataset size < batch size, the loader produces zero batches, then `epoch_loss / n` divides by zero.
+
+**Fix**: Changed to `drop_last=False`, added early return for empty datasets, and guarded the division with `n > 0`.
+
+### MEDIUM: Empty Tasks from Invalid Configs
+
+`SplitDatasetSequence` silently accepted configs where `n_tasks * classes_per_task > num_classes`, producing later tasks with empty class lists and zero samples. This compounds with the baseline training bug above.
+
+**Fix**: Added upfront validation raising `ValueError` when the config exceeds available classes.
+
+### MEDIUM: Unsafe Checkpoint Loading
+
+`torch.load(..., weights_only=False)` was used in `steering.py` and `ghost_mic.py`. This enables arbitrary code execution from crafted checkpoint files (pickle deserialization).
+
+**Fix**: Switched to `weights_only=True`. Verified both checkpoint formats (`pchead_pretrained.ckpt` and `pchead.ckpt`) load correctly — they contain only tensors, dicts, lists, and scalars.
+
+### LOW: Silent Checkpoint Save Failure
+
+The atexit handler used bare `except: pass`, hiding any persistence failure on shutdown.
+
+**Fix**: Replaced with `logger.exception()` so failures are visible in the server log.
+
+---
+
+## 13. Open Questions
 
 **Does convergence matter?** None of the 73 turns achieved convergence. It's unclear whether convergence would improve signal quality, or whether the non-converged settling dynamics already capture the relevant information.
 
@@ -489,7 +541,7 @@ The practical consequence: the PCHead can detect that two inputs are "the same k
 
 ---
 
-## 13. File Map
+## 14. File Map
 
 ```
 src/pcdc/
@@ -546,7 +598,7 @@ docs/
 
 ---
 
-## 14. Summary of Numerical Results
+## 15. Summary of Numerical Results
 
 ### Energy Dynamics Across Sessions
 
@@ -588,7 +640,7 @@ docs/
 
 ---
 
-## 15. What's Next
+## 16. What's Next
 
 1. **Live retrieval test** — Run a session with MemoryGate connected and thresholds tuned to actually trigger. Verify that retrieved context changes response quality.
 

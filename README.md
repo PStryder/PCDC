@@ -576,6 +576,7 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - SQLite telemetry database records per-turn deviation vectors, energies, match scores, and temperature (`--telemetry-db`)
 - **Off-corpus generalization confirmed**: pre-trained deviation matches generalize to novel domains not in the bootstrap corpus (avg 0.728 off-corpus vs 0.731 on-corpus vs ~0.07 untrained baseline). Tested on sports, law, music, agriculture, film, psychology, linguistics, and truly alien domains (dog grooming, cricket, knitting)
 - **210-turn long-session stability confirmed**: IQR adaptive scale converges by turn ~50 (IQR/Median: 0.494→0.615→0.380→0.238 at turns 25/50/100/200); E_recon rises on 50% of transitions (definitively not monotonically declining at scale); signal crossing rate 50.2% (105/209); temperature stable across full session (mean 1.16, range 0.62–1.49, no floor/ceiling hits); deviation match stable with CV=8.5% and drift of only 0.007 between first and second half. Tested with 6 structured scenarios (sustained domain, rapid switching, gradual drift, return to origin, complexity ladder, repetition probe) plus 105 general prompts across 21 domains
+- **Hardened against 7 audit findings** (see Security & Robustness section below)
 
 **What's next:**
 - Store text alongside deviation replay entries so deviation-matched text can be used as retrieval query directly (currently the user's prompt is used)
@@ -584,6 +585,20 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Run MNIST to convergence and tune hyperparameters for >90% accuracy
 - End-to-end GGUF continual learning with a real model
 - Benchmark forgetting: PCHead vs baselines across task sequences
+
+## Security & Robustness Fixes
+
+A code audit identified 7 findings (2 high, 4 medium, 1 low), all fixed:
+
+| # | Severity | Issue | Fix |
+|---|----------|-------|-----|
+| 1 | HIGH | PCHead config (`eta_w`/`K`) left corrupted after exception during online training phases | Wrapped Phase 1+2 training in `try/finally` so config is always restored (`steering.py`) |
+| 2 | HIGH | Prompt-template injection via unvalidated `role` field and raw memory text containing `<\|...\|>` tokens | Constrained `role` to `Literal["system", "user", "assistant"]` (`schemas.py`); added `_sanitize_template_text()` to strip Llama-3 special tokens from retrieved memory (`app.py`) |
+| 3 | MEDIUM | Streaming generation blocked the async event loop (sync `for` over LLM iterator) | Replaced with `await loop.run_in_executor()` using sentinel-based `next()` (`app.py`) |
+| 4 | MEDIUM | Baseline training crashed with `ZeroDivisionError` when dataset smaller than batch size | Changed `drop_last=True` → `False`, added empty-dataset guard and `n==0` division guard (`baselines.py`) |
+| 5 | MEDIUM | `SplitDatasetSequence` allowed configs producing empty tasks (`n_tasks * classes_per_task > num_classes`) | Added validation raising `ValueError` on invalid configs (`datasets.py`) |
+| 6 | MEDIUM | `torch.load(..., weights_only=False)` enabled arbitrary code execution from untrusted checkpoints | Switched to `weights_only=True` (`steering.py`, `ghost_mic.py`) |
+| 7 | LOW | Checkpoint save failures on exit silently swallowed (`except: pass`) | Replaced with `logger.exception()` for visibility (`app.py`) |
 
 ## Session 5 — Long-Session Characterisation (210 Turns)
 
