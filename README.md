@@ -122,13 +122,16 @@ src/pcdc/
 │   └── schemas.py                 # Pydantic models (request/response/SSE)
 │
 ├── data/
-│   └── bootstrap_corpus.txt       # Diverse text corpus for PCHead pre-training
+│   ├── bootstrap_corpus.txt       # Diverse text corpus for PCHead pre-training
+│   └── long_session_prompts.json  # 210 prompts with domain/complexity metadata for long-session testing
 │
 scripts/                               # Standalone experiment and utility scripts
 ├── pretrain_pchead.py                 # Offline PCHead pre-training for attractor basins
 ├── ghost_mic.py                       # Deviation vector analysis experiments
 ├── gather_telemetry.py                # On-corpus telemetry collection (20 prompts, 8 domains)
 ├── gather_telemetry_offcorpus.py      # Off-corpus generalization test (20 prompts, novel domains)
+├── long_session_test.py               # 210-turn long-session test runner with full transcript capture
+├── analyse_session.py                 # Post-hoc analysis: 7 diagnostic plots + summary markdown
 └── plot_session.py                    # Session energy visualization
 │
 ├── training/                      # Training loops and evaluation
@@ -563,7 +566,7 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Replay buffer mixing in both training phases to prevent catastrophic forgetting
 - PCHead checkpoint save/load with full replay state across server restarts
 - Plotting script for energy and cosine distance visualization (`scripts/plot_session.py`)
-- Validated across two live sessions: eta_w=1e-5 preserves novelty sensitivity over 12+ turns
+- Validated across five live sessions: eta_w=1e-5 preserves novelty sensitivity over 210+ turns
 - Offline pre-training bootstraps attractor basins from a text corpus (`scripts/pretrain_pchead.py`)
 - Deviation routing: deviation-to-deviation cosine similarity triggers memory retrieval based on prediction error fingerprints
 - Pre-trained deviations show semantic domain matching (Rust prompt matches Rust paragraph at cos=0.654, philosophy matches philosophy at cos=0.608)
@@ -572,6 +575,7 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - Adaptive IQR temperature scale — auto-calibrates to the model's energy distribution, replaces fixed scale that caused saturation (18 unique temps vs 3)
 - SQLite telemetry database records per-turn deviation vectors, energies, match scores, and temperature (`--telemetry-db`)
 - **Off-corpus generalization confirmed**: pre-trained deviation matches generalize to novel domains not in the bootstrap corpus (avg 0.728 off-corpus vs 0.731 on-corpus vs ~0.07 untrained baseline). Tested on sports, law, music, agriculture, film, psychology, linguistics, and truly alien domains (dog grooming, cricket, knitting)
+- **210-turn long-session stability confirmed**: IQR adaptive scale converges by turn ~50 (IQR/Median: 0.494→0.615→0.380→0.238 at turns 25/50/100/200); E_recon rises on 50% of transitions (definitively not monotonically declining at scale); signal crossing rate 50.2% (105/209); temperature stable across full session (mean 1.16, range 0.62–1.49, no floor/ceiling hits); deviation match stable with CV=8.5% and drift of only 0.007 between first and second half. Tested with 6 structured scenarios (sustained domain, rapid switching, gradual drift, return to origin, complexity ladder, repetition probe) plus 105 general prompts across 21 domains
 
 **What's next:**
 - Store text alongside deviation replay entries so deviation-matched text can be used as retrieval query directly (currently the user's prompt is used)
@@ -581,8 +585,76 @@ This is a research prototype. The core PC dynamics and local learning rules are 
 - End-to-end GGUF continual learning with a real model
 - Benchmark forgetting: PCHead vs baselines across task sequences
 
+## Session 5 — Long-Session Characterisation (210 Turns)
+
+The longest test: 210 turns across 6 structured scenarios and 21 domains, probing system stability at scale. Full transcripts, telemetry, and analysis in `results/`.
+
+### Test Structure
+
+| Scenario | Turns | What it probes |
+|----------|-------|----------------|
+| `sustained_domain` | 20 | 10 CS → 10 philosophy. Within-domain E_recon stabilisation |
+| `rapid_switching` | 20 | Alternating 6 domains, 2 full cycles. E_predict under constant pivots |
+| `gradual_drift` | 15 | CS → math → physics → chemistry → biology. Gradual vs abrupt transitions |
+| `return_to_origin` | 25 | 5 CS, 15 philosophy, 5 CS (same sub-topics). Deviation routing across a gap |
+| `complexity_ladder` | 15 | CS only: 5 simple → 5 moderate → 5 dense. E_recon vs complexity |
+| `repetition_probe` | 10 | Same prompt 5×, novel, repeat, 3 novel. Energy floor + spike |
+| General corpus | 105 | 21 domains, mixed complexity, edge cases ("Why?", code, German) |
+
+### Key Findings
+
+**IQR adaptive scale converges:**
+
+| Checkpoint | Median | IQR | IQR/Median |
+|------------|--------|-----|------------|
+| Turn 25 | 3438 | 1699 | 0.494 |
+| Turn 50 | 4910 | 3021 | 0.615 |
+| Turn 100 | 5899 | 2240 | 0.380 |
+| Turn 200 | 6452 | 1538 | 0.238 |
+
+The ΔIQR plot shows wild swings in the first ~40 turns, then flatlines near zero. By turn 50-60 the adaptive scale has found its footing and holds steady through 210.
+
+**Energy is NOT monotonically declining:** E_recon rises on 50% of transitions (104/209). The PCHead responds to novel content at every turn, even at turn 210. This definitively answers the session 2 question — the 7/25 rises were not noise.
+
+**Signal crossing rate: 50.2%** (105/209 transitions). E_recon and E_predict are genuinely independent signals — the scatter plot confirms broad spread around the diagonal with no domain clustering.
+
+**Temperature stays responsive:** Mean 1.16, range 0.62–1.49, no floor or ceiling hits. No drift over time. The adaptive IQR scale prevents the saturation seen in session 3's fixed scale.
+
+**Deviation routing is stable at scale:** Mean deviation match 0.82, CV=8.5%, drift of only 0.007 between first and second halves. The repetition probe shows deviation match pinning to 1.000 during repeated prompts (turns 96-105), dropping on novel input. Edge cases ("Why?", German text) correctly produce the lowest scores (~0.63-0.66).
+
+**No performance degradation:** Response time stable at ~18s per turn across all 210 turns.
+
+### Running the Test Suite
+
+```bash
+# Quick validation (10 turns)
+python scripts/long_session_test.py --scenario repetition_probe --delay 1.0
+
+# All structured scenarios (105 turns)
+python scripts/long_session_test.py --scenario all
+
+# Full run (210 turns, ~70 min)
+python scripts/long_session_test.py --scenario full --label "my-session"
+
+# Analyse results (7 plots + summary markdown)
+python scripts/analyse_session.py --input results/session_YYYYMMDD_HHMMSS.json
+```
+
+### Analysis Outputs
+
+The analysis script produces 7 diagnostic plots and a summary markdown:
+
+1. **Energy Trajectory** — E_recon/E_predict with crossing markers, blended energy with IQR bands, cosine distance
+2. **Temperature Distribution** — trajectory over turns (color-coded by domain) + histogram
+3. **IQR/Median Evolution** — cumulative median, IQR, and ΔIQR convergence
+4. **Deviation Match Score** — trajectory with threshold line and domain annotations
+5. **Signal Crossing Analysis** — E_recon vs E_predict scatter, colored by domain
+6. **Per-Domain Statistics** — grouped bars with error bars for all metrics
+7. **Deviation Norm Stability** — trajectory with mean/σ bands and CV
+
 ## Documentation
 
 - [System Architecture](docs/system_architecture.md) — detailed explanation of how all components work together
 - [Session 3 — Pre-Trained PCHead + Deviation Routing](docs/session_transcript_2026-02-27_session3.md) — first live session with pre-trained checkpoint, deviation routing, and adaptive IQR temperature fix
 - [Session 4 — Off-Corpus Generalization](docs/session_transcript_2026-02-27_session4.md) — test of deviation matching on 17 domains not in the bootstrap corpus
+- Session 5 — Long-Session Characterisation: `results/session_20260228_transcript_analysis/` (7 plots + summary)
