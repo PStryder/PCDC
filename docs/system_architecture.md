@@ -192,6 +192,8 @@ adjusted_temp = base_temp * (1 + alpha * tanh((energy - median) / scale))
 
 **Effect**: novel or surprising content gets higher temperature (more creative responses), familiar or expected content gets lower temperature (more precise responses). The temperature adapts automatically to the conversation's dynamics.
 
+When `energy_scale=0` (the default), scale is computed adaptively from the IQR of the blended energy history. This normalises the tanh input so +/- 1 IQR from median maps to tanh(+/- 1). Session 5 validated that this adaptive scale converges by turn ~50 and remains stable through 200+ turns (IQR/Median drops from 0.49 to 0.24 without collapsing or diverging).
+
 ### Learning Rate Sensitivity
 
 The online learning rate `eta_w` is critical:
@@ -430,6 +432,59 @@ Uses deviation vectors as retrieval keys against the replay buffer. Four sub-tes
 **Results without pre-training** (25 online turns only):
 
 All cosine similarities 0.05-0.09 — near-orthogonal. No semantic discrimination. This confirmed that pre-training is essential.
+
+## Long-Session Test Suite
+
+`scripts/long_session_test.py` + `scripts/analyse_session.py` + `data/long_session_prompts.json`
+
+The long-session test suite validates system behaviour over 100-200+ turns — well beyond the 20-25 turn sessions used during initial development.
+
+### Test Runner
+
+`long_session_test.py` follows the same `urllib.request` pattern as `gather_telemetry.py` but is designed for extended runs:
+
+```
+python scripts/long_session_test.py \
+    --scenario full --delay 2.0 --max-tokens 80 \
+    --output results/session_YYYYMMDD.json --label "long-session-v1"
+```
+
+**Prompt corpus** (`data/long_session_prompts.json`): 210 prompts organised as 6 structured scenarios (105 prompts) probing specific dynamics, plus a general corpus (105 prompts) across 21 domains. Each entry carries `domain` and `complexity` metadata for post-hoc analysis.
+
+**Structured scenarios**:
+
+| Scenario | Turns | Tests |
+|----------|-------|-------|
+| `sustained_domain` | 20 | Within-domain energy stabilisation |
+| `rapid_switching` | 20 | E_predict under constant domain pivots |
+| `gradual_drift` | 15 | Gradual vs abrupt transition dynamics |
+| `return_to_origin` | 25 | Deviation routing across a domain gap |
+| `complexity_ladder` | 15 | E_recon response to complexity within a domain |
+| `repetition_probe` | 10 | Energy floor on repeated content + novelty spike |
+
+**Running modes**: `--scenario full` (all 210), `--scenario all` (6 scenarios only), `--scenario general` (general corpus only), or any individual scenario name. Error handling: log and continue (or `--fail-fast` to abort). Fetches final `/v1/pcdc/stats` snapshot.
+
+### Analysis Pipeline
+
+`analyse_session.py` reads the runner's JSON output and produces 7 diagnostic plots plus a summary markdown:
+
+1. **Energy Trajectory** — E_recon + E_predict with crossing markers, blended energy with median/IQR bands, cosine distance bars. Scenario boundaries annotated.
+2. **Temperature Distribution** — Histogram + trajectory over turns, color-coded by domain.
+3. **IQR/Median Evolution** — Rolling IQR scale at each turn. Key plot for validating adaptive scaling at scale.
+4. **Deviation Match Score** — Trajectory with threshold line and domain annotations.
+5. **Signal Crossing Analysis** — E_recon vs E_predict scatter, colored by domain.
+6. **Per-Domain Statistics** — Grouped bars for mean energy, cosine distance, deviation match, temperature per domain.
+7. **Deviation Norm Stability** — Norm trajectory over turns.
+
+The auto-generated summary includes: run metadata, global statistics table, IQR stability at checkpoints (turn 25/50/100/200), signal crossing rates, per-domain summary, and auto-detected observations.
+
+### Key Finding: System Stability at 210 Turns
+
+Session 5 confirmed long-session stability across all subsystems:
+- IQR/Median converges from 0.49 (turn 25) to 0.24 (turn 200)
+- Energy signals remain non-monotonic (50% of transitions show E_recon increases)
+- Temperature spans [0.62, 1.49] without floor/ceiling domination
+- Deviation match stable at mean 0.82 (drift 0.007)
 
 ## Signal Summary
 
