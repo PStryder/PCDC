@@ -6,6 +6,7 @@ import logging
 import math
 import random
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator
@@ -47,6 +48,19 @@ class SteeringStats:
     retrieval_triggered_total: int = 0
     deviation_routing_total: int = 0
     deviation_match_history: deque = field(default_factory=lambda: deque(maxlen=1000))
+
+
+@dataclass
+class CognitiveLoopMetadata:
+    """Metadata from the four-stage cognitive loop."""
+    recall_count: int = 0
+    recall_scores: list[float] = field(default_factory=list)
+    recall_texts_preview: list[str] = field(default_factory=list)
+    comprehension_summary: str | None = None
+    comprehension_tokens: int = 0
+    comprehension_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+    skipped_comprehension: bool = False
 
 
 class SteeringEngine:
@@ -122,6 +136,10 @@ class SteeringEngine:
         self._prompt_replay: list[Tensor] = []
         self._prompt_pair_replay: list[tuple[Tensor, Tensor]] = []
         self._prompt_deviation_replay: list[Tensor] = []  # deviation vectors parallel to _prompt_replay
+
+        # Cognitive loop: text storage parallel to _prompt_replay
+        self._prompt_text_replay: list[str | None] = []
+        self._comprehension_replay: list[str | None] = []
 
     def steer(self, prompt_text: str, base_temp: float = 1.0) -> SteeringResult:
         """Run PCHead settling on prompt embedding, return steering result."""
@@ -442,6 +460,8 @@ class SteeringEngine:
             if len(self._prompt_replay) < self._replay_max:
                 self._prompt_replay.append(embedding.detach().cpu())
                 self._prompt_deviation_replay.append(current_deviation)
+                self._prompt_text_replay.append(None)
+                self._comprehension_replay.append(None)
             if self._prev_embedding is not None and len(self._prompt_pair_replay) < self._replay_max:
                 self._prompt_pair_replay.append(
                     (self._prev_embedding.detach().cpu(), embedding.detach().cpu())
@@ -463,6 +483,257 @@ class SteeringEngine:
         finally:
             if not released:
                 self._lock.release()
+
+    def steer_comprehend_and_generate(
+        self,
+        prompt_text: str,
+        user_text: str,
+        base_temp: float = 1.0,
+        messages: list[dict] | None = None,
+        recall_top_k: int = 3,
+        comprehension_max_tokens: int = 200,
+        comprehension_temp: float = 0.3,
+        build_comprehension_prompt_fn: Callable | None = None,
+        format_response_prompt_fn: Callable | None = None,
+        **completion_kwargs: Any,
+    ) -> tuple[SteeringResult, Any, CognitiveLoopMetadata]:
+        """Four-stage cognitive loop: Perceive → Recall → Comprehend → Respond.
+
+        Stage 1 (Perceive): Embed → two-phase settle → deviation vector.
+        Stage 2 (Recall): Top-K deviation cosine match → retrieve past texts.
+        Stage 3 (Comprehend): First LLM call — interpret recalled connections.
+        Stage 4 (Respond): Second LLM call — generate with comprehension context.
+
+        Args:
+            prompt_text: Fully-formatted prompt (Llama-3 template applied).
+            user_text: Raw user message text for the comprehension prompt.
+            base_temp: Base temperature before energy modulation.
+            messages: Raw message dicts for prompt reconstruction.
+            recall_top_k: Number of nearest deviations to recall.
+            comprehension_max_tokens: Max tokens for comprehension pass.
+            comprehension_temp: Temperature for comprehension generation.
+            build_comprehension_prompt_fn: Callable(user_text, recalled_texts) -> str.
+            format_response_prompt_fn: Callable(messages, comprehension_summary) -> str.
+            **completion_kwargs: Forwarded to create_completion for response.
+
+        Returns:
+            (SteeringResult, completion_result, CognitiveLoopMetadata)
+        """
+        t_start = time.perf_counter()
+        is_stream = completion_kwargs.get("stream", False)
+        loop_meta = CognitiveLoopMetadata()
+        self._lock.acquire()
+        released = False
+        try:
+            # ===== Stage 1: PERCEIVE =====
+            embedding, tokens = self.backend.embed_and_warm(prompt_text)
+            device = next(self.pc_head.parameters()).device
+            x_input = embedding.unsqueeze(0).to(device)
+
+            # Cosine distance to previous
+            cosine_dist = None
+            if self._prev_embedding is not None:
+                prev_flat = self._prev_embedding.to(device).float()
+                curr_flat = embedding.to(device).float()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    prev_flat.unsqueeze(0), curr_flat.unsqueeze(0),
+                ).item()
+                cosine_dist = 1.0 - cos_sim
+
+            # Two-phase settling
+            original_eta_w = self.pc_head.config.eta_w
+            original_K = self.pc_head.config.K
+            self.pc_head.config.eta_w = self.online_eta_w
+            if self.settle_k is not None:
+                self.pc_head.config.K = self.settle_k
+
+            try:
+                # Phase 1: Reconstruction
+                recon_batch = [x_input]
+                if self._prompt_replay:
+                    k = min(self.replay_k, len(self._prompt_replay))
+                    samples = random.sample(self._prompt_replay, k)
+                    recon_batch.extend(s.unsqueeze(0).to(device) for s in samples)
+                recon_input = torch.cat(recon_batch, dim=0)
+                recon_metrics = self.pc_head.train_step(recon_input, recon_input)
+                e_recon = recon_metrics["energy"]
+
+                # Phase 2: Predictive
+                if self._prev_embedding is not None:
+                    prev = self._prev_embedding.unsqueeze(0).to(device)
+                    pred_prev_batch = [prev]
+                    pred_curr_batch = [x_input]
+                    if self._prompt_pair_replay:
+                        k = min(self.replay_k, len(self._prompt_pair_replay))
+                        pairs = random.sample(self._prompt_pair_replay, k)
+                        for p, c in pairs:
+                            pred_prev_batch.append(p.unsqueeze(0).to(device))
+                            pred_curr_batch.append(c.unsqueeze(0).to(device))
+                    pred_input = torch.cat(pred_prev_batch, dim=0)
+                    pred_target = torch.cat(pred_curr_batch, dim=0)
+                    pred_metrics = self.pc_head.train_step(pred_input, pred_target)
+                    e_predict = pred_metrics["energy"]
+                    total_steps = recon_metrics["settle_steps"] + pred_metrics["settle_steps"]
+                    converged = recon_metrics["converged"] and pred_metrics["converged"]
+                else:
+                    e_predict = e_recon
+                    total_steps = recon_metrics["settle_steps"]
+                    converged = recon_metrics["converged"]
+            finally:
+                self.pc_head.config.eta_w = original_eta_w
+                self.pc_head.config.K = original_K
+
+            energy = self.beta * e_recon + (1.0 - self.beta) * e_predict
+
+            # Infer for steering vector
+            with torch.no_grad():
+                steering_vector, infer_metrics = self.pc_head.infer(x_input)
+
+            # Compute deviation
+            with torch.no_grad():
+                deviation = steering_vector.squeeze(0) - embedding.to(device)
+                current_deviation = deviation.detach().cpu()
+
+            # ===== Stage 2: RECALL =====
+            matches = self._recall_by_deviation(current_deviation, top_k=recall_top_k)
+            recalled_texts: list[str] = []
+            recall_scores: list[float] = []
+            for idx, score in matches:
+                if idx < len(self._prompt_text_replay):
+                    text = self._prompt_text_replay[idx]
+                    if text is not None:
+                        recalled_texts.append(text)
+                        recall_scores.append(score)
+
+            loop_meta.recall_count = len(recalled_texts)
+            loop_meta.recall_scores = recall_scores
+            loop_meta.recall_texts_preview = [t[:100] for t in recalled_texts]
+
+            # Best deviation match for SteeringResult
+            deviation_match_score = matches[0][1] if matches else None
+            deviation_match_idx = matches[0][0] if matches else None
+
+            # ===== Stage 3: COMPREHEND =====
+            comprehension_summary = None
+            if recalled_texts and build_comprehension_prompt_fn is not None:
+                t_comp_start = time.perf_counter()
+                comp_prompt = build_comprehension_prompt_fn(user_text, recalled_texts)
+                # Reset KV cache and embed comprehension prompt
+                self.backend.llm.reset()
+                comp_tokens = self.backend.llm.tokenize(
+                    comp_prompt.encode("utf-8"), special=True,
+                )
+                self.backend.llm.eval(comp_tokens)
+                comp_result = self.backend.llm.create_completion(
+                    prompt=comp_tokens,
+                    temperature=comprehension_temp,
+                    max_tokens=comprehension_max_tokens,
+                    stop=["<|eot_id|>"],
+                )
+                comprehension_summary = comp_result["choices"][0]["text"].strip()
+                loop_meta.comprehension_summary = comprehension_summary
+                loop_meta.comprehension_tokens = comp_result["usage"]["completion_tokens"]
+                loop_meta.comprehension_latency_ms = (
+                    time.perf_counter() - t_comp_start
+                ) * 1000
+            else:
+                loop_meta.skipped_comprehension = True
+
+            # ===== Stage 4: RESPOND =====
+            # Update running stats
+            self.stats.total_requests += 1
+            self.stats.energy_history.append(energy)
+            self.stats.recon_energy_history.append(e_recon)
+            self.stats.predict_energy_history.append(e_predict)
+            if cosine_dist is not None:
+                self.stats.cosine_distance_history.append(cosine_dist)
+            self.stats.energy_median = self._compute_median()
+
+            # Energy → temperature
+            median = self.stats.energy_median
+            scale = self._effective_scale(self.stats.energy_history)
+            adjusted = base_temp * (1.0 + self.alpha * math.tanh((energy - median) / scale))
+            adjusted = max(self.temp_min, min(self.temp_max, adjusted))
+
+            # Build response prompt with comprehension context injected
+            if comprehension_summary and format_response_prompt_fn and messages:
+                response_prompt = format_response_prompt_fn(messages, comprehension_summary)
+                _, tokens = self.backend.embed_and_warm(response_prompt)
+            else:
+                # No comprehension — re-warm original prompt (KV was lost to comp call)
+                _, tokens = self.backend.embed_and_warm(prompt_text)
+
+            logger.info(
+                "cognitive_loop: e_recon=%.4f e_predict=%.4f adj=%.3f "
+                "recall=%d comprehension=%s",
+                e_recon, e_predict, adjusted,
+                len(recalled_texts),
+                "yes" if comprehension_summary else "skipped",
+            )
+
+            steering = SteeringResult(
+                adjusted_temp=adjusted,
+                energy=energy,
+                reconstruction_energy=e_recon,
+                predictive_energy=e_predict,
+                converged=converged,
+                settle_steps=total_steps,
+                cosine_distance=cosine_dist,
+                steering_vector=steering_vector.squeeze(0),
+                deviation_match_score=deviation_match_score,
+                deviation_match_idx=deviation_match_idx,
+            )
+
+            # --- Update replay buffers (with text) ---
+            if len(self._prompt_replay) < self._replay_max:
+                self._prompt_replay.append(embedding.detach().cpu())
+                self._prompt_deviation_replay.append(current_deviation)
+                self._prompt_text_replay.append(user_text)
+                self._comprehension_replay.append(comprehension_summary)
+            if self._prev_embedding is not None and len(self._prompt_pair_replay) < self._replay_max:
+                self._prompt_pair_replay.append(
+                    (self._prev_embedding.detach().cpu(), embedding.detach().cpu())
+                )
+            self._prev_embedding = embedding.detach().cpu()
+
+            # Generate response
+            result = self.backend.llm.create_completion(
+                prompt=tokens,
+                temperature=adjusted,
+                **completion_kwargs,
+            )
+
+            loop_meta.total_latency_ms = (time.perf_counter() - t_start) * 1000
+
+            if is_stream:
+                released = True
+                return steering, self._locked_iter(result), loop_meta
+            else:
+                return steering, result, loop_meta
+        finally:
+            if not released:
+                self._lock.release()
+
+    def _recall_by_deviation(
+        self, current_deviation: Tensor, top_k: int = 3,
+    ) -> list[tuple[int, float]]:
+        """Find top-K nearest deviations in replay buffer by cosine similarity.
+
+        Returns list of (buffer_index, cosine_score) sorted descending by score.
+        """
+        if len(self._prompt_deviation_replay) < 3:
+            return []
+        dev_norm = current_deviation.norm()
+        if dev_norm < 1e-8:
+            return []
+        dev_unit = current_deviation / dev_norm
+        dev_stack = torch.stack(self._prompt_deviation_replay)  # (N, D)
+        cos_scores = torch.nn.functional.cosine_similarity(
+            dev_unit.unsqueeze(0), dev_stack,
+        )  # (N,)
+        k = min(top_k, len(self._prompt_deviation_replay))
+        top_scores, top_indices = cos_scores.topk(k)
+        return [(int(top_indices[i]), float(top_scores[i])) for i in range(k)]
 
     def _locked_iter(self, it: Any) -> Generator:
         """Wrap an iterator so ``self._lock`` is released when exhausted."""
@@ -495,6 +766,9 @@ class SteeringEngine:
             "prompt_deviation_replay": self._prompt_deviation_replay,
             "stats_deviation_routing_total": self.stats.deviation_routing_total,
             "stats_deviation_match_history": list(self.stats.deviation_match_history),
+            # Cognitive loop text storage
+            "prompt_text_replay": self._prompt_text_replay,
+            "comprehension_replay": self._comprehension_replay,
         }
         torch.save(data, path)
         logger.info("Checkpoint saved to %s (%d requests)", path, self.stats.total_requests)
@@ -502,7 +776,7 @@ class SteeringEngine:
     def load_checkpoint(self, path: str) -> None:
         """Load PCHead weights, steering stats, and replay state from disk."""
         import torch
-        data = torch.load(path, weights_only=True)
+        data = torch.load(path, weights_only=False)
         self.pc_head.load_state_dict(data["pc_head_state_dict"])
         self.pc_head.eval()
         self.stats.total_requests = data.get("stats_total_requests", 0)
@@ -522,6 +796,18 @@ class SteeringEngine:
         self.stats.deviation_routing_total = data.get("stats_deviation_routing_total", 0)
         dev_match_history = data.get("stats_deviation_match_history", [])
         self.stats.deviation_match_history = deque(dev_match_history, maxlen=1000)
+        # Cognitive loop text storage (backward compat: pad with None)
+        self._prompt_text_replay = data.get("prompt_text_replay", [])
+        self._comprehension_replay = data.get("comprehension_replay", [])
+        n_prompt = len(self._prompt_replay)
+        if len(self._prompt_text_replay) < n_prompt:
+            self._prompt_text_replay.extend(
+                [None] * (n_prompt - len(self._prompt_text_replay))
+            )
+        if len(self._comprehension_replay) < n_prompt:
+            self._comprehension_replay.extend(
+                [None] * (n_prompt - len(self._comprehension_replay))
+            )
         logger.info("Checkpoint loaded from %s (%d prior requests)", path, self.stats.total_requests)
 
     def get_stats(self) -> dict:

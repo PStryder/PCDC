@@ -25,6 +25,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int = 256
     stream: bool = False
     stop: list[str] | str | None = None
+    cognitive_loop: bool = False
 
 
 # --- PCDC metadata (extra field, ignored by standard frontends) ---
@@ -40,6 +41,12 @@ class PCDCMetadata(BaseModel):
     retrieval_triggered: bool = False
     retrieval_count: int = 0
     deviation_match_score: float | None = None
+    # Cognitive loop fields
+    cognitive_loop_enabled: bool = False
+    recall_count: int | None = None
+    recall_scores: list[float] | None = None
+    comprehension_summary: str | None = None
+    comprehension_latency_ms: float | None = None
 
 
 # --- Non-streaming response ---

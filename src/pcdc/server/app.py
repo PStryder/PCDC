@@ -112,6 +112,49 @@ def format_augmented_prompt(messages: list[dict], memory_results: list) -> str:
     return format_llama3_prompt([context_msg] + original_msgs)
 
 
+def build_comprehension_prompt(user_text: str, recalled_texts: list[str]) -> str:
+    """Build a Llama-3 formatted comprehension pre-pass prompt.
+
+    The comprehension pass interprets what connects the current input
+    with experientially similar past interactions recalled via deviation matching.
+    """
+    recalled_block = "\n".join(
+        f"[{i + 1}] {_sanitize_template_text(t[:500])}"
+        for i, t in enumerate(recalled_texts)
+    )
+    messages = [
+        ChatMessage(
+            role="system",
+            content="You are analyzing patterns across a conversation. Be concise.",
+        ),
+        ChatMessage(
+            role="user",
+            content=(
+                f'Current input: "{_sanitize_template_text(user_text[:500])}"\n\n'
+                f"Related past interactions:\n{recalled_block}\n\n"
+                "In 1-2 sentences, what connects these experiences? "
+                "What pattern is emerging?"
+            ),
+        ),
+    ]
+    return format_llama3_prompt(messages)
+
+
+def format_comprehension_response_prompt(
+    messages: list[dict], comprehension_summary: str,
+) -> str:
+    """Rebuild Llama-3 prompt with comprehension summary injected as system context."""
+    safe_summary = _sanitize_template_text(comprehension_summary)
+    context_msg = ChatMessage(
+        role="system",
+        content=(
+            f"Contextual insight from experiential pattern matching:\n{safe_summary}"
+        ),
+    )
+    original_msgs = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]
+    return format_llama3_prompt([context_msg] + original_msgs)
+
+
 def create_app(config: ServerConfig) -> FastAPI:
     """Factory that creates the FastAPI app with lifespan."""
 
@@ -261,29 +304,68 @@ def create_app(config: ServerConfig) -> FastAPI:
             # Raw messages for potential retrieval-triggered prompt rebuild
             messages_raw = [{"role": m.role, "content": m.content} for m in request.messages]
 
-            # Single atomic call: embed → steer → retrieval gate → generate
-            steering, result = await asyncio.to_thread(
-                engine.steer_and_generate,
-                prompt,
-                request.temperature,
-                messages=messages_raw,
-                top_p=request.top_p,
-                max_tokens=request.max_tokens,
-                stop=stop or [],
-            )
+            if request.cognitive_loop:
+                # Extract user text for comprehension prompt
+                user_text = ""
+                for m in reversed(request.messages):
+                    if m.role == "user":
+                        user_text = m.content
+                        break
 
-            pcdc_meta = PCDCMetadata(
-                settling_energy=steering.energy,
-                reconstruction_energy=steering.reconstruction_energy,
-                predictive_energy=steering.predictive_energy,
-                converged=steering.converged,
-                adjusted_temperature=steering.adjusted_temp,
-                settle_steps=steering.settle_steps,
-                cosine_distance=steering.cosine_distance,
-                retrieval_triggered=steering.retrieval_triggered,
-                retrieval_count=steering.retrieval_count,
-                deviation_match_score=steering.deviation_match_score,
-            )
+                steering, result, loop_meta = await asyncio.to_thread(
+                    engine.steer_comprehend_and_generate,
+                    prompt,
+                    user_text,
+                    request.temperature,
+                    messages=messages_raw,
+                    build_comprehension_prompt_fn=build_comprehension_prompt,
+                    format_response_prompt_fn=format_comprehension_response_prompt,
+                    top_p=request.top_p,
+                    max_tokens=request.max_tokens,
+                    stop=stop or [],
+                )
+
+                pcdc_meta = PCDCMetadata(
+                    settling_energy=steering.energy,
+                    reconstruction_energy=steering.reconstruction_energy,
+                    predictive_energy=steering.predictive_energy,
+                    converged=steering.converged,
+                    adjusted_temperature=steering.adjusted_temp,
+                    settle_steps=steering.settle_steps,
+                    cosine_distance=steering.cosine_distance,
+                    retrieval_triggered=steering.retrieval_triggered,
+                    retrieval_count=steering.retrieval_count,
+                    deviation_match_score=steering.deviation_match_score,
+                    cognitive_loop_enabled=True,
+                    recall_count=loop_meta.recall_count,
+                    recall_scores=loop_meta.recall_scores,
+                    comprehension_summary=loop_meta.comprehension_summary,
+                    comprehension_latency_ms=loop_meta.comprehension_latency_ms,
+                )
+            else:
+                # Standard PCDC path
+                steering, result = await asyncio.to_thread(
+                    engine.steer_and_generate,
+                    prompt,
+                    request.temperature,
+                    messages=messages_raw,
+                    top_p=request.top_p,
+                    max_tokens=request.max_tokens,
+                    stop=stop or [],
+                )
+
+                pcdc_meta = PCDCMetadata(
+                    settling_energy=steering.energy,
+                    reconstruction_energy=steering.reconstruction_energy,
+                    predictive_energy=steering.predictive_energy,
+                    converged=steering.converged,
+                    adjusted_temperature=steering.adjusted_temp,
+                    settle_steps=steering.settle_steps,
+                    cosine_distance=steering.cosine_distance,
+                    retrieval_triggered=steering.retrieval_triggered,
+                    retrieval_count=steering.retrieval_count,
+                    deviation_match_score=steering.deviation_match_score,
+                )
 
             content = result["choices"][0]["text"]
             usage = result.get("usage", {})
